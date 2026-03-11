@@ -1,0 +1,21 @@
+{
+  "name": "shield-guard",
+  "version": "1.0.0",
+  "description": "Anti-DDoS reverse proxy shield for websites",
+  "main": "shield.js",
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --platform=node --target=node18 --outfile=shield.js --minify",
+    "build:dev": "esbuild src/main.ts --bundle --platform=node --target=node18 --outfile=shield.js --sourcemap",
+    "dev": "ts-node src/main.ts"
+  },
+  "dependencies": {
+    "http-proxy": "^1.18.1",
+    "selfsigned": "^2.4.1"
+  },
+  "devDependencies": {
+    "@types/http-proxy": "^1.17.14",
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.4.0"
+  }
+}

@@ -1,0 +1,9 @@
+node_modules/
+dist/
+shield.js
+*.log
+.env
+*.pem
+shield.config.json
+.DS_Store
+Thumbs.db
