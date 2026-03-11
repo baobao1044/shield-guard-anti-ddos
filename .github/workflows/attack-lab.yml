@@ -1,0 +1,46 @@
+name: Attack Lab
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Attack lab profile label
+        required: false
+        default: standard
+      artifact_retention_days:
+        description: Artifact retention days
+        required: false
+        default: "7"
+
+jobs:
+  attack-lab:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run attack lab
+        env:
+          SHIELD_ARTIFACT_DIR: ${{ github.workspace }}/attack-artifacts
+          SHIELD_ATTACK_PROFILE: ${{ inputs.profile }}
+        run: node tests/run-attack-lab.mjs
+
+      - name: Upload attack artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: attack-lab-${{ inputs.profile }}
+          path: attack-artifacts
+          retention-days: ${{ fromJSON(inputs.artifact_retention_days) }}

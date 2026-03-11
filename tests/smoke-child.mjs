@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import http from 'node:http';
 import net from 'node:net';
 import { once } from 'node:events';
@@ -37,6 +38,31 @@ async function waitFor(url, timeoutMs = 8000) {
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
   throw lastError ?? new Error(`Timed out waiting for ${url}`);
+}
+
+async function stopProcess(child) {
+  if (!child) return;
+  if (process.platform === 'win32') {
+    if (child.exitCode === null) {
+      try {
+        execFileSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore' });
+      } catch {
+        // ignore: process may already be gone
+      }
+    }
+    return;
+  }
+  if (child.exitCode === null) {
+    child.kill('SIGTERM');
+    await Promise.race([
+      once(child, 'exit'),
+      new Promise((resolve) => setTimeout(resolve, 4000)),
+    ]);
+    if (child.exitCode === null) {
+      child.kill('SIGKILL');
+      await once(child, 'exit');
+    }
+  }
 }
 
 async function main() {
@@ -104,10 +130,7 @@ async function main() {
     const uamOff = await fetch(`${shieldBase}/shield-api/uam/off`).then((response) => response.json());
     assert.equal(uamOff.uamActive, false);
   } finally {
-    if (shield.exitCode === null) {
-      shield.kill('SIGTERM');
-      shield.kill('SIGKILL');
-    }
+    await stopProcess(shield);
     backend.closeAllConnections?.();
     backend.closeIdleConnections?.();
     backend.close(() => {});

@@ -226,6 +226,22 @@ An optional deeper smoke flow is also available:
 npm run test:smoke
 ```
 
+A local attack-lab workflow is also available:
+
+```bash
+npm run test:attack
+```
+
+That flow starts a disposable backend and Shield Guard instance, generates representative attack traffic, captures `dstat`, and writes metrics/events logs for review.
+
+## GitHub Actions
+
+This repo now ships with three workflows:
+
+- `CI`: runs `typecheck`, `build`, `test`, and `test:smoke` on Ubuntu and Windows
+- `Attack Lab`: manual workflow that runs the attack harness, captures `dstat`, and uploads metrics/events/log artifacts
+- `Release`: builds `shield.js`, packages a release bundle, and publishes assets on version tags
+
 A legacy Bash smoke script is still included for manual Unix-style testing and benchmarking:
 
 ```bash

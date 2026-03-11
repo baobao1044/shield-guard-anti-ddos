@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Package bundle
+        shell: bash
+        run: |
+          mkdir -p dist-artifact
+          cp shield.js README.md LICENSE package.json shield.config.json.example dist-artifact/
+          tar -czf shield-guard-bundle.tgz -C dist-artifact .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shield-guard-bundle
+          path: |
+            shield.js
+            shield-guard-bundle.tgz
+
+      - name: Publish GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            shield.js
+            shield-guard-bundle.tgz

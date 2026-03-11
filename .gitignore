@@ -7,3 +7,4 @@ shield.js
 shield.config.json
 .DS_Store
 Thumbs.db
+tests/artifacts/
