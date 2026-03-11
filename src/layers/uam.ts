@@ -34,12 +34,21 @@ export class UnderAttackMode {
 
   // Track pending challenges: nonce → {ip, issuedAt}
   private pendingChallenges: LRUCache<{ ip: string; issuedAt: number }>;
+  private failedAttempts: LRUCache<number>;
+  private stats = {
+    activations: 0,
+    deactivations: 0,
+    challengesIssued: 0,
+    challengesPassed: 0,
+    challengesFailed: 0,
+  };
 
   constructor(config: UAMConfig) {
     this.config = config;
     this.active = config.enabled;
     this.hmacSecret = crypto.randomBytes(32).toString('hex');
     this.pendingChallenges = new LRUCache(100000, 120000); // 2 min TTL
+    this.failedAttempts = new LRUCache<number>(100000, 300000);
     if (this.active) log.warn('Under Attack Mode is ACTIVE');
   }
 
@@ -48,6 +57,7 @@ export class UnderAttackMode {
   activate(): void {
     if (!this.active) {
       this.active = true;
+      this.stats.activations++;
       log.warn('Under Attack Mode ACTIVATED');
     }
   }
@@ -55,13 +65,14 @@ export class UnderAttackMode {
   deactivate(): void {
     if (this.active) {
       this.active = false;
+      this.stats.deactivations++;
       log.info('Under Attack Mode deactivated');
     }
   }
 
   // Check if this path is exempt from UAM
   isExempt(url: string): boolean {
-    const path = url.split('?')[0];
+    const path = this.normalizePath(url);
     return this.config.exemptPaths.some(p => path.startsWith(p));
   }
 
@@ -99,14 +110,17 @@ export class UnderAttackMode {
   issueChallenge(ip: string): string {
     const nonce = crypto.randomBytes(16).toString('hex');
     this.pendingChallenges.set(nonce, { ip, issuedAt: Date.now() });
+    this.stats.challengesIssued++;
     return nonce;
   }
 
   // Verify PoW solution: SHA256(nonce + ':' + solution) starts with N zero hex chars
   verifySolution(nonce: string, solution: string, ip: string): boolean {
     const pending = this.pendingChallenges.get(nonce);
-    if (!pending) return false;
-    if (pending.ip !== ip) return false;
+    if (!pending || pending.ip !== ip) {
+      this.recordFailure(ip);
+      return false;
+    }
 
     const hash = crypto
       .createHash('sha256')
@@ -114,9 +128,14 @@ export class UnderAttackMode {
       .digest('hex');
 
     const required = '0'.repeat(this.config.difficulty);
-    if (!hash.startsWith(required)) return false;
+    if (!hash.startsWith(required)) {
+      this.recordFailure(ip);
+      return false;
+    }
 
     this.pendingChallenges.delete(nonce);
+    this.stats.challengesPassed++;
+    this.failedAttempts.delete(ip);
     return true;
   }
 
@@ -131,6 +150,29 @@ export class UnderAttackMode {
 
   private sign(data: string): string {
     return crypto.createHmac('sha256', this.hmacSecret).update(data).digest('hex').substring(0, 32);
+  }
+
+  getStats() {
+    return {
+      ...this.stats,
+      active: this.active,
+      pendingChallenges: this.pendingChallenges.getSize(),
+    };
+  }
+
+  getFailedAttempts(ip: string): number {
+    return this.failedAttempts.get(ip) ?? 0;
+  }
+
+  private normalizePath(url: string): string {
+    const path = url.split('#', 1)[0];
+    return path.split('?', 1)[0] || '/';
+  }
+
+  private recordFailure(ip: string): void {
+    const failures = (this.failedAttempts.get(ip) ?? 0) + 1;
+    this.failedAttempts.set(ip, failures);
+    this.stats.challengesFailed++;
   }
 
   // Render the UAM challenge HTML page
@@ -175,6 +217,8 @@ export class UnderAttackMode {
     const prefix = '0'.repeat(difficulty);
     const status = document.getElementById('status');
     const bar = document.getElementById('bar');
+    const logo = document.querySelector('.logo');
+    if (logo) logo.textContent = 'SG';
 
     // Proof-of-Work: find solution s.t. SHA256(nonce + ':' + solution) starts with prefix
     async function sha256hex(str) {
@@ -218,6 +262,7 @@ export class UnderAttackMode {
       if (res.ok) {
         status.className = 'status done';
         status.textContent = '✓ Security check passed. Loading page...';
+        status.textContent = 'Security check passed. Loading page...';
         setTimeout(() => location.reload(), 300);
       } else {
         throw new Error('Verification failed');

@@ -352,6 +352,10 @@ export class L4Filter {
     return null;
   }
 
+  onHeadersProgress(connId: string, ip: string, bytesReceived: number, headersComplete: boolean): FilterResult | null {
+    return this.processSlowloris(connId, ip, bytesReceived, headersComplete);
+  }
+
   // === Port Scan Detection ===
 
   private detectPortScan(packet: PacketInfo): FilterResult | null {
@@ -497,7 +501,16 @@ export class L4Filter {
       ...this.stats,
       halfOpenConnections: this.halfOpenCount,
       totalConnections: this.totalConnections,
+      trackedSlowConnections: this.slowConnections.getSize(),
     };
+  }
+
+  getConnectionCount(): number {
+    return this.totalConnections;
+  }
+
+  getActiveConnectionCount(): number {
+    return this.totalConnections;
   }
 
   resetStats(): void {

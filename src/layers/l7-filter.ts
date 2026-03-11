@@ -67,8 +67,8 @@ const BAD_BOT_SIGNATURES = [
   'phantom', 'selenium', 'headlesschrome', 'puppeteer',
 ];
 
-// Good bot signatures (allow)
-const GOOD_BOT_SIGNATURES = [
+// Common search/indexer signatures. We do not auto-allow them because UA strings are spoofable.
+const SEARCH_BOT_SIGNATURES = [
   'googlebot', 'bingbot', 'slurp', 'duckduckbot', 'baiduspider',
   'yandexbot', 'facebot', 'twitterbot', 'linkedinbot',
 ];
@@ -83,15 +83,13 @@ export class L7Filter {
   private endpointCounters: LRUCache<SlidingWindowCounter>;
 
   // Bot detection
-  private botScores: LRUCache<number>;
+  private botScores: LRUCache<{ score: number; lastSeen: number }>;
   private fingerprintCache: LRUCache<{
     userAgents: Set<string>;
     endpoints: Set<string>;
     methods: Set<string>;
     requestTimes: number[];
   }>;
-  private challengeTokens: LRUCache<string>;
-
   // WAF state
   private wafHits: LRUCache<{ count: number; patterns: string[] }>;
   private knownPayloads: BloomFilter;
@@ -124,9 +122,8 @@ export class L7Filter {
     this.globalRateCounter = new SlidingWindowCounter(config.rateLimiting.global.windowMs);
     this.ipRateBuckets = new LRUCache<TokenBucket>(100000, 120000);
     this.endpointCounters = new LRUCache<SlidingWindowCounter>(10000, 60000);
-    this.botScores = new LRUCache<number>(100000, 300000);
+    this.botScores = new LRUCache<{ score: number; lastSeen: number }>(100000, 300000);
     this.fingerprintCache = new LRUCache(50000, 300000);
-    this.challengeTokens = new LRUCache<string>(100000, 30000);
     this.wafHits = new LRUCache(100000, 600000);
     this.knownPayloads = new BloomFilter(100000, 0.001);
     this.uniqueIPs = new HyperLogLog(14);
@@ -211,7 +208,7 @@ export class L7Filter {
   }
 
   private checkEndpointRateLimit(request: HTTPRequest): FilterResult | null {
-    const key = `${request.method}:${request.url}`;
+    const key = `${request.method}:${this.normalizePath(request.url)}`;
     let counter = this.endpointCounters.get(key);
     if (!counter) {
       counter = new SlidingWindowCounter(this.config.rateLimiting.perEndpoint.windowMs);
@@ -354,13 +351,13 @@ export class L7Filter {
 
   private detectBot(request: HTTPRequest): FilterResult | null {
     const ua = (request.userAgent || '').toLowerCase();
-    let score = this.botScores.get(request.ip) || 0;
+    const now = request.timestamp;
+    const botState = this.botScores.get(request.ip) || { score: 0, lastSeen: now };
+    let score = botState.score;
+    const idleMs = now - botState.lastSeen;
 
-    // Good bots - skip detection
-    for (const sig of GOOD_BOT_SIGNATURES) {
-      if (ua.includes(sig)) {
-        return null; // TODO: verify with reverse DNS
-      }
+    if (idleMs > 30000) {
+      score = Math.max(0, score - Math.floor(idleMs / 30000) * 10);
     }
 
     // Known bad bots
@@ -368,7 +365,7 @@ export class L7Filter {
       if (ua.includes(sig)) {
         score += 50;
         this.stats.botBlocked++;
-        this.botScores.set(request.ip, score);
+        this.botScores.set(request.ip, { score, lastSeen: now });
         return {
           action: Action.DROP,
           reason: `Known bad bot: ${sig}`,
@@ -376,6 +373,13 @@ export class L7Filter {
           threatLevel: ThreatLevel.HIGH,
           processingTimeUs: 0,
         };
+      }
+    }
+
+    for (const sig of SEARCH_BOT_SIGNATURES) {
+      if (ua.includes(sig)) {
+        score += 5;
+        break;
       }
     }
 
@@ -393,13 +397,16 @@ export class L7Filter {
     if (!request.headers['accept']) score += 10;
     if (!request.headers['accept-language']) score += 10;
     if (!request.headers['accept-encoding']) score += 5;
+    if (!request.headers['sec-fetch-site']) score += 5;
+    if (!request.headers['sec-fetch-mode']) score += 5;
+    if (!request.headers['cookie'] && request.method !== 'GET' && request.method !== 'HEAD') score += 5;
 
     // Suspicious method + path combos
     if (request.method !== 'GET' && request.method !== 'POST' && request.method !== 'HEAD') {
       score += 15;
     }
 
-    this.botScores.set(request.ip, score);
+    this.botScores.set(request.ip, { score, lastSeen: now });
 
     if (score >= this.config.botDetection.challengeThreshold) {
       if (score >= this.config.botDetection.challengeThreshold * 1.5) {
@@ -465,8 +472,12 @@ export class L7Filter {
     }
 
     // Endpoint diversity
-    fp.endpoints.add(request.url);
+    const normalizedPath = this.normalizePath(request.url);
+    fp.endpoints.add(normalizedPath);
     fp.methods.add(request.method);
+
+    if (fp.endpoints.size > 20) score += 20;
+    else if (fp.endpoints.size > 10) score += 10;
 
     return score;
   }
@@ -518,29 +529,6 @@ export class L7Filter {
     return null;
   }
 
-  // === Challenge System ===
-
-  generateChallenge(ip: string): { token: string; challenge: string } {
-    const token = Math.random().toString(36).substring(2) + Date.now().toString(36);
-    this.challengeTokens.set(`${ip}:${token}`, token);
-
-    // Simple JS challenge (in production, this would be more complex)
-    const a = Math.floor(Math.random() * 1000);
-    const b = Math.floor(Math.random() * 1000);
-    return {
-      token,
-      challenge: `Please compute: ${a} + ${b} = ?`,
-    };
-  }
-
-  verifyChallenge(ip: string, token: string, answer: string): boolean {
-    const stored = this.challengeTokens.get(`${ip}:${token}`);
-    if (!stored) return false;
-    this.challengeTokens.delete(`${ip}:${token}`);
-    // In production, verify the actual challenge answer
-    return true;
-  }
-
   // === Analytics ===
 
   getAnalytics() {
@@ -553,6 +541,11 @@ export class L7Filter {
 
   private elapsed(start: bigint): number {
     return Number(process.hrtime.bigint() - start) / 1000;
+  }
+
+  private normalizePath(url: string): string {
+    const path = url.split('#', 1)[0];
+    return path.split('?', 1)[0] || '/';
   }
 
   private result(

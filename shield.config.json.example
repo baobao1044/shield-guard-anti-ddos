@@ -1,10 +1,6 @@
 {
   "target": "http://localhost:3000",
-  "port": 80,
-  "httpsPort": 443,
-  "tls": {
-    "selfSigned": true
-  },
+  "port": 8080,
   "dashboardPassword": "changeme123",
   "shield": {
     "global": {
@@ -12,29 +8,53 @@
       "emergencyThreshold": 100000,
       "whitelistIPs": []
     },
-    "l3": {
-      "enabled": true,
-      "spoofDetection": { "enabled": true, "bogonFiltering": true },
-      "maxPacketSize": 65535,
-      "rateLimits": {
-        "icmp": { "maxRequests": 100 },
-        "perIP": { "maxRequests": 1000, "windowMs": 1000 }
-      }
-    },
-    "l4": {
-      "enabled": true,
-      "synFloodProtection": { "enabled": true, "maxHalfOpen": 10000, "maxSynRate": 200, "synCookies": true },
-      "connectionLimits": { "maxTotal": 100000, "maxPerIP": 100, "idleTimeoutMs": 30000 }
-    },
     "l7": {
       "enabled": true,
       "rateLimiting": {
-        "global": { "windowMs": 1000, "maxRequests": 50000 },
-        "perIP": { "maxRequests": 200, "windowMs": 1000, "burstSize": 500 },
-        "perEndpoint": { "windowMs": 1000, "maxRequests": 1000 }
+        "global": {
+          "windowMs": 1000,
+          "maxRequests": 50000
+        },
+        "perIP": {
+          "maxRequests": 200,
+          "windowMs": 1000,
+          "burstSize": 500
+        },
+        "perEndpoint": {
+          "windowMs": 1000,
+          "maxRequests": 1000
+        }
       },
-      "waf": { "enabled": true, "sqlInjection": true, "xss": true, "pathTraversal": true, "commandInjection": true },
-      "botDetection": { "enabled": true, "challengeThreshold": 50, "fingerprintAnalysis": true }
+      "waf": {
+        "enabled": true,
+        "sqlInjection": true,
+        "xss": true,
+        "pathTraversal": true,
+        "commandInjection": true
+      },
+      "botDetection": {
+        "enabled": true,
+        "challengeThreshold": 50,
+        "fingerprintAnalysis": true
+      },
+      "headerValidation": {
+        "enabled": true,
+        "requiredHeaders": [
+          "host"
+        ],
+        "maxHeaders": 100,
+        "maxHeaderSize": 16384
+      }
     }
+  },
+  "uam": {
+    "enabled": false,
+    "difficulty": 4,
+    "cookieTTLSeconds": 3600,
+    "autoActivateThreshold": 5000,
+    "exemptPaths": [
+      "/shield-health",
+      "/shield-api/"
+    ]
   }
 }

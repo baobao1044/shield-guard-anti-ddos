@@ -3,16 +3,26 @@
 // ============================================================================
 
 import * as fs from 'fs';
-import * as path from 'path';
 import { AntiDDoSShield } from './core/shield';
 import { createProxyServer } from './proxy/server';
 import { ServerConfig } from './core/types';
 import { Logger } from './utils/logger';
 import { startDstat } from './stats/dstat';
+import { ConfigValidationError, normalizeServerConfig } from './core/config';
 
 const log = new Logger('Main');
 
 // ============ CLI Argument Parser ============
+
+function parseIntegerFlag(flag: string, value: string | undefined): number {
+  if (value === undefined) {
+    throw new ConfigValidationError(`${flag} requires a value`);
+  }
+  if (!/^\d+$/.test(value)) {
+    throw new ConfigValidationError(`${flag} must be a positive integer`);
+  }
+  return Number.parseInt(value, 10);
+}
 
 function parseArgs(): Partial<ServerConfig> & { configFile?: string; dstat?: boolean; dstatOnly?: boolean; dstatUrl?: string; dstatRefresh?: number } {
   const args = process.argv.slice(2);
@@ -24,8 +34,8 @@ function parseArgs(): Partial<ServerConfig> & { configFile?: string; dstat?: boo
 
     switch (arg) {
       case '--target':   result.target = next; i++; break;
-      case '--port':     result.port = parseInt(next); i++; break;
-      case '--https-port': result.httpsPort = parseInt(next); i++; break;
+      case '--port':     result.port = parseIntegerFlag('--port', next); i++; break;
+      case '--https-port': result.httpsPort = parseIntegerFlag('--https-port', next); i++; break;
       case '--password': result.dashboardPassword = next; i++; break;
       case '--cert':     result.tls = { ...result.tls, cert: next }; i++; break;
       case '--key':      result.tls = { ...result.tls, key: next }; i++; break;
@@ -33,7 +43,7 @@ function parseArgs(): Partial<ServerConfig> & { configFile?: string; dstat?: boo
       case '--config':   result.configFile = next; i++; break;
       case '--dstat':    result.dstat = true; break;
       case '--dstat-only': result.dstatOnly = true; result.dstatUrl = next ?? 'http://localhost:8080'; i++; break;
-      case '--dstat-refresh': result.dstatRefresh = parseInt(next) * 1000; i++; break;
+      case '--dstat-refresh': result.dstatRefresh = parseIntegerFlag('--dstat-refresh', next) * 1000; i++; break;
       case '--help': printHelp(); process.exit(0); break;
     }
   }
@@ -62,11 +72,13 @@ function loadConfig(): ServerConfig {
   }
 
   // CLI args override file config
-  const merged: ServerConfig = {
+  const merged: Partial<ServerConfig> = {
     target: cli.target ?? (fileConfig.target as string) ?? 'http://localhost:3000',
     port: cli.port ?? (fileConfig.port as number) ?? 8080,
     httpsPort: cli.httpsPort ?? (fileConfig.httpsPort as number | undefined),
-    tls: cli.tls ?? (fileConfig.tls as ServerConfig['tls']),
+    tls: cli.tls || fileConfig.tls
+      ? { ...(fileConfig.tls as ServerConfig['tls'] | undefined), ...(cli.tls ?? {}) }
+      : undefined,
     dashboardPassword: cli.dashboardPassword ?? (fileConfig.dashboardPassword as string | undefined),
     shield: (fileConfig as ServerConfig).shield,
     uam: (fileConfig as ServerConfig).uam,
@@ -75,7 +87,7 @@ function loadConfig(): ServerConfig {
     tlsGuard: (fileConfig as ServerConfig).tlsGuard,
   };
 
-  return merged;
+  return normalizeServerConfig(merged);
 }
 
 function printHelp(): void {
@@ -128,10 +140,36 @@ ${config.dashboardPassword ? '  \x1b[33m→\x1b[0m Dashboard password: \x1b[90m[
 `);
 }
 
+function printBannerClean(config: ServerConfig): void {
+  const hasHttps = !!config.httpsPort;
+  console.log(`
+\x1b[1m\x1b[36m
+   ____  _     _      _     ____                      _
+  / ___|| |__ (_) ___| | __/ ___| _   _  __ _ _ __ __| |
+  \\___ \\| '_ \\| |/ _ \\ |/ / |  _ | | | |/ _\` | '__/ _\` |
+   ___) | | | | |  __/   <| |_| || |_| | (_| | | | (_| |
+  |____/|_| |_|_|\\___|_|\\_\\\\____(_)__,_|\\__,_|_|  \\__,_|
+\x1b[0m\x1b[1m          G U A R D  v1.0.0\x1b[0m
+
+  \x1b[32m->\x1b[0m Target:    ${config.target}
+  \x1b[32m->\x1b[0m HTTP:      http://0.0.0.0:${config.port}${hasHttps ? `\n  \x1b[32m->\x1b[0m HTTPS:     https://0.0.0.0:${config.httpsPort}` : ''}
+  \x1b[32m->\x1b[0m Dashboard: http://localhost:${config.port}/shield-dashboard
+  \x1b[32m->\x1b[0m Health:    http://localhost:${config.port}/shield-health
+${config.dashboardPassword ? '  \x1b[33m->\x1b[0m Dashboard password: \x1b[90m[protected]\x1b[0m' : '  \x1b[33m!\x1b[0m  Dashboard: \x1b[33mno password set\x1b[0m (use --password)'}
+`);
+}
+
 // ============ Main ============
 
 function main(): void {
-  const cli = getParsedArgs();
+  let cli: ReturnType<typeof parseArgs>;
+  try {
+    cli = getParsedArgs();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to parse CLI arguments';
+    log.error(message);
+    process.exit(1);
+  }
 
   // --dstat-only: just show terminal monitor, don't start proxy
   if (cli.dstatOnly) {
@@ -140,14 +178,16 @@ function main(): void {
     return;
   }
 
-  const config = loadConfig();
-
-  if (!config.target) {
-    log.error('No target specified. Use --target http://localhost:3000');
+  let config: ServerConfig;
+  try {
+    config = loadConfig();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Invalid configuration';
+    log.error(message);
     process.exit(1);
   }
 
-  printBanner(config);
+  printBannerClean(config);
 
   const shield = new AntiDDoSShield(config.shield);
   const { uam } = createProxyServer(config, shield);

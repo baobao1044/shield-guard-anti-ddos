@@ -63,6 +63,7 @@ export class L3Filter {
   process(packet: PacketInfo): FilterResult {
     const start = process.hrtime.bigint();
     this.stats.totalProcessed++;
+    const requestDerivedTraffic = packet.protocol === Protocol.HTTP || packet.protocol === Protocol.HTTPS;
 
     // 1. Blacklist check (fastest - O(1) bloom filter)
     if (this.blacklistExact.has(packet.srcIP) || this.blacklist.has(packet.srcIP)) {
@@ -73,7 +74,7 @@ export class L3Filter {
     }
 
     // 2. Land Attack detection (src == dst)
-    if (packet.srcIP === packet.dstIP) {
+    if (!requestDerivedTraffic && packet.srcIP === packet.dstIP) {
       this.stats.landAttack++;
       this.escalateIP(packet.srcIP, 'LAND_ATTACK', 30);
       return this.result(Action.DROP, 'Land attack detected', ThreatLevel.CRITICAL, start);
@@ -88,21 +89,21 @@ export class L3Filter {
     }
 
     // 4. Packet size validation
-    if (packet.size > this.config.maxPacketSize) {
+    if (!requestDerivedTraffic && packet.size > this.config.maxPacketSize) {
       this.stats.oversizeDropped++;
       this.escalateIP(packet.srcIP, 'OVERSIZE_PACKET', 5);
       return this.result(Action.DROP, `Oversize packet: ${packet.size}B`, ThreatLevel.MEDIUM, start);
     }
 
     // 5. TTL validation
-    if (packet.ttl !== undefined && packet.ttl < this.config.minTTL) {
+    if (!requestDerivedTraffic && packet.ttl !== undefined && packet.ttl < this.config.minTTL) {
       this.stats.ttlBlocked++;
       this.escalateIP(packet.srcIP, 'LOW_TTL', 3);
       return this.result(Action.DROP, `Low TTL: ${packet.ttl}`, ThreatLevel.LOW, start);
     }
 
     // 6. ICMP rate limiting
-    if (packet.protocol === Protocol.ICMP) {
+    if (!requestDerivedTraffic && packet.protocol === Protocol.ICMP) {
       const bucket = this.getOrCreateICMPBucket(packet.srcIP);
       if (!bucket.consume()) {
         this.stats.icmpLimited++;
@@ -125,6 +126,7 @@ export class L3Filter {
     if (this.config.ipReputation.enabled) {
       const profile = this.getIPProfile(packet.srcIP);
       profile.totalRequests++;
+      const elapsed = packet.timestamp - profile.lastSeen;
       profile.lastSeen = packet.timestamp;
 
       if (profile.reputationScore >= this.config.ipReputation.maxScore) {
@@ -134,14 +136,13 @@ export class L3Filter {
       }
 
       // Decay reputation score over time
-      const elapsed = packet.timestamp - profile.lastSeen;
       if (elapsed > this.config.ipReputation.decayRateMs) {
         profile.reputationScore = Math.max(0, profile.reputationScore - 1);
       }
     }
 
     // 9. Fragment flood detection
-    if (packet.size < 68 && packet.protocol === Protocol.TCP) {
+    if (!requestDerivedTraffic && packet.size < 68 && packet.protocol === Protocol.TCP) {
       const fragKey = packet.srcIP;
       const current = (this.fragmentCounters.get(fragKey) || 0) + 1;
       this.fragmentCounters.set(fragKey, current);
@@ -230,6 +231,10 @@ export class L3Filter {
   removeFromBlacklist(ip: string): void {
     this.blacklistExact.delete(ip);
     // Bloom filter entries can't be removed - they'll eventually be replaced
+  }
+
+  getBlacklistSize(): number {
+    return this.blacklistExact.size;
   }
 
   private result(

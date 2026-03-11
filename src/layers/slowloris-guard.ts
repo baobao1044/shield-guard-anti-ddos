@@ -42,6 +42,8 @@ interface ConnState {
 
 export class SlowlorisGuard {
   private readonly config: SlowlorisConfig;
+  private activeConnections = 0;
+  private activePendingHeaders = 0;
 
   // ip → count of active connections
   private connPerIP: LRUCache<number>;
@@ -69,7 +71,8 @@ export class SlowlorisGuard {
     if (!this.config.enabled) return;
 
     server.on('connection', (socket: net.Socket) => {
-      const ip = socket.remoteAddress ?? '0.0.0.0';
+      const ip = this.normalizeIP(socket.remoteAddress ?? '0.0.0.0');
+      this.activeConnections++;
 
       // === Per-IP connection limit ===
       const current = (this.connPerIP.get(ip) ?? 0) + 1;
@@ -80,12 +83,14 @@ export class SlowlorisGuard {
         log.debug(`Conn limit from ${ip}: ${current} connections`);
         socket.destroy();
         this.connPerIP.set(ip, current - 1);
+        this.activeConnections = Math.max(0, this.activeConnections - 1);
         return;
       }
 
       // Track pending headers count
       const pending = (this.pendingHeadersPerIP.get(ip) ?? 0) + 1;
       this.pendingHeadersPerIP.set(ip, pending);
+      this.activePendingHeaders++;
 
       if (pending > this.config.maxPendingHeaders) {
         this.stats.slowHeadersKilled++;
@@ -93,6 +98,8 @@ export class SlowlorisGuard {
         socket.destroy();
         this.connPerIP.set(ip, current - 1);
         this.pendingHeadersPerIP.set(ip, pending - 1);
+        this.activeConnections = Math.max(0, this.activeConnections - 1);
+        this.activePendingHeaders = Math.max(0, this.activePendingHeaders - 1);
         return;
       }
 
@@ -146,6 +153,7 @@ export class SlowlorisGuard {
             // Update pending headers count
             const p = (this.pendingHeadersPerIP.get(ip) ?? 1) - 1;
             this.pendingHeadersPerIP.set(ip, Math.max(0, p));
+            this.activePendingHeaders = Math.max(0, this.activePendingHeaders - 1);
 
             // Start body rate check
             this.startBodyRateCheck(socket, state);
@@ -161,10 +169,12 @@ export class SlowlorisGuard {
 
         const c = (this.connPerIP.get(ip) ?? 1) - 1;
         this.connPerIP.set(ip, Math.max(0, c));
+        this.activeConnections = Math.max(0, this.activeConnections - 1);
 
         if (!state.headersDone) {
           const p = (this.pendingHeadersPerIP.get(ip) ?? 1) - 1;
           this.pendingHeadersPerIP.set(ip, Math.max(0, p));
+          this.activePendingHeaders = Math.max(0, this.activePendingHeaders - 1);
         }
       });
 
@@ -205,6 +215,14 @@ export class SlowlorisGuard {
   }
 
   getStats() {
-    return { ...this.stats };
+    return {
+      ...this.stats,
+      activeConnections: this.activeConnections,
+      activePendingHeaders: this.activePendingHeaders,
+    };
+  }
+
+  private normalizeIP(ip: string): string {
+    return ip.startsWith('::ffff:') ? ip.slice(7) : ip;
   }
 }

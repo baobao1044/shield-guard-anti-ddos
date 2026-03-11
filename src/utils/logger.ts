@@ -13,6 +13,18 @@ const BOLD = '\x1b[1m';
 const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
 type LogLevel = keyof typeof LEVELS;
 
+function safeStringify(meta: object): string {
+  const seen = new WeakSet<object>();
+  return JSON.stringify(meta, (_key, value) => {
+    if (typeof value === 'bigint') return value.toString();
+    if (typeof value === 'object' && value !== null) {
+      if (seen.has(value)) return '[Circular]';
+      seen.add(value);
+    }
+    return value;
+  });
+}
+
 export class Logger {
   private readonly prefix: string;
   private readonly level: number;
@@ -31,7 +43,14 @@ export class Logger {
     const tag = `${BOLD}${color}[${this.prefix}]${RESET}`;
     const lvl = `${color}${levelTag}${RESET}`;
     const message = `${msg}`;
-    const metaStr = meta ? ` ${GRAY}${JSON.stringify(meta)}${RESET}` : '';
+    let metaStr = '';
+    if (meta) {
+      try {
+        metaStr = ` ${GRAY}${safeStringify(meta)}${RESET}`;
+      } catch {
+        metaStr = ` ${GRAY}[unserializable-meta]${RESET}`;
+      }
+    }
     return `${ts} ${tag} ${lvl} ${message}${metaStr}`;
   }
 

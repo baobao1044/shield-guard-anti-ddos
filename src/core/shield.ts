@@ -17,11 +17,14 @@ import { Logger } from '../utils/logger';
 export interface BlockEvent {
   ts: number;
   ip: string;
+  method?: string;
+  path?: string;
   layer: string;
+  reasonCode: string;
   reason: string;
   action: string;
   threatLevel: ThreatLevel;
-  url?: string;
+  source?: string;
 }
 
 export class AntiDDoSShield {
@@ -46,6 +49,7 @@ export class AntiDDoSShield {
   // Threat tracking
   private threatsByLayer = { l3: 0, l4: 0, l7: 0 };
   private attackVectors: Map<string, number> = new Map();
+  private reasonCodes: Map<string, number> = new Map();
 
   // Live event feed (last 200 blocked events)
   private recentEvents: CircularBuffer<BlockEvent>;
@@ -57,6 +61,9 @@ export class AntiDDoSShield {
 
   // Whitelist
   private whitelist: Set<string>;
+  private runtimeStats = {
+    activeConnections: 0,
+  };
 
   constructor(config?: Partial<ShieldConfig>) {
     this.config = this.mergeConfig(config);
@@ -187,7 +194,7 @@ export class AntiDDoSShield {
       };
       const l3Result = this.l3.process(l3Packet);
       if (l3Result.action !== Action.ALLOW) {
-        this.recordResult(l3Result, request.ip, request.url);
+        this.recordResult(l3Result, request.ip, request.method, request.url);
         return l3Result;
       }
     }
@@ -196,7 +203,7 @@ export class AntiDDoSShield {
     if (this.config.l7.enabled) {
       const l7Result = this.l7.process(request);
       if (l7Result.action !== Action.ALLOW) {
-        this.recordResult(l7Result, request.ip, request.url);
+        this.recordResult(l7Result, request.ip, request.method, request.url);
         return l7Result;
       }
     }
@@ -246,9 +253,21 @@ export class AntiDDoSShield {
     this.l3.addToBlacklist(ip);
   }
 
+  setRuntimeStats(stats: Partial<typeof this.runtimeStats>): void {
+    this.runtimeStats = { ...this.runtimeStats, ...stats };
+  }
+
+  getCurrentRPS(): number {
+    const currentRPS = this.rpsCounter.getRate();
+    if (currentRPS > this.peakRPS) {
+      this.peakRPS = currentRPS;
+    }
+    return currentRPS;
+  }
+
   // === Metrics ===
 
-  private recordResult(result: FilterResult, ip?: string, url?: string): void {
+  private recordResult(result: FilterResult, ip?: string, method?: string, path?: string): void {
     this.processingTimes.push(result.processingTimeUs);
 
     switch (result.action) {
@@ -274,19 +293,37 @@ export class AntiDDoSShield {
     // Track attack vectors
     const vector = `${result.layer}:${result.reason.split(':')[0].trim()}`;
     this.attackVectors.set(vector, (this.attackVectors.get(vector) || 0) + 1);
+    const reasonCode = this.getReasonCode(result);
+    this.reasonCodes.set(reasonCode, (this.reasonCodes.get(reasonCode) || 0) + 1);
 
     // Push to live event feed
     if (result.action !== Action.ALLOW && ip) {
       this.recentEvents.push({
         ts: Date.now(),
         ip,
+        method,
+        path,
         layer: result.layer,
+        reasonCode,
         reason: result.reason,
         action: result.action,
         threatLevel: result.threatLevel,
-        url,
+        source: typeof result.metadata?.source === 'string' ? result.metadata.source : undefined,
       });
     }
+  }
+
+  private getReasonCode(result: FilterResult): string {
+    const explicit = result.metadata?.reasonCode;
+    if (typeof explicit === 'string' && explicit.trim() !== '') {
+      return explicit.trim().toUpperCase();
+    }
+
+    return `${result.layer}_${result.reason}`
+      .toUpperCase()
+      .replace(/[^A-Z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 80) || 'UNKNOWN';
   }
 
   getMetrics(): ShieldMetrics {
@@ -299,6 +336,10 @@ export class AntiDDoSShield {
       .sort((a, b) => b[1] - a[1])
       .slice(0, 10)
       .map(([vector, count]) => ({ vector, count }));
+    const topReasonCodes = Array.from(this.reasonCodes.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([code, count]) => ({ code, count }));
 
     return {
       totalPackets: this.totalPackets,
@@ -308,11 +349,13 @@ export class AntiDDoSShield {
       totalRateLimited: this.totalRateLimited,
       avgProcessingTimeUs: avgTime,
       peakRPS: this.peakRPS,
-      currentRPS: (() => { const r = this.rpsCounter.getRate(); if (r > this.peakRPS) this.peakRPS = r; return r; })(),
-      activeConnections: 0,
-      blacklistedIPs: 0,
+      currentRPS: this.getCurrentRPS(),
+      activeConnections: Math.max(this.runtimeStats.activeConnections, this.l4.getActiveConnectionCount()),
+      blacklistedIPs: this.l3.getBlacklistSize(),
+      emergencyMode: this.emergencyMode,
       threatsByLayer: { ...this.threatsByLayer },
       topAttackVectors: topVectors,
+      topReasonCodes,
       uptimeMs: Date.now() - this.startTime,
     };
   }
@@ -338,6 +381,7 @@ export class AntiDDoSShield {
     this.totalRateLimited = 0;
     this.threatsByLayer = { l3: 0, l4: 0, l7: 0 };
     this.attackVectors.clear();
+    this.reasonCodes.clear();
     this.l3.resetStats();
     this.l4.resetStats();
     this.l7.resetStats();

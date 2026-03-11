@@ -122,8 +122,6 @@ export class LRUCache<T> {
 
     if (Date.now() > node.expiresAt) {
       this.removeNode(node);
-      this.map.delete(key);
-      this.size--;
       return undefined;
     }
 
@@ -165,8 +163,6 @@ export class LRUCache<T> {
     const node = this.map.get(key);
     if (!node) return;
     this.removeNode(node);
-    this.map.delete(key);
-    this.size--;
   }
 
   has(key: string): boolean {
@@ -179,16 +175,22 @@ export class LRUCache<T> {
 
   private moveToHead(node: LRUNode<T>): void {
     if (node === this.head) return;
-    this.removeNode(node);
-    node.prev = null;
-    node.next = this.head;
-    if (this.head) this.head.prev = node;
-    this.head = node;
-    if (!this.tail) this.tail = node;
-    this.size++;
+    this.detachNode(node);
+    this.prependNode(node);
   }
 
   private removeNode(node: LRUNode<T>): void {
+    this.detachNode(node);
+    this.map.delete(node.key);
+    this.size--;
+  }
+
+  private evictLRU(): void {
+    if (!this.tail) return;
+    this.removeNode(this.tail);
+  }
+
+  private detachNode(node: LRUNode<T>): void {
     if (node.prev) node.prev.next = node.next;
     else this.head = node.next;
 
@@ -197,14 +199,14 @@ export class LRUCache<T> {
 
     node.prev = null;
     node.next = null;
-    this.size--;
   }
 
-  private evictLRU(): void {
-    if (!this.tail) return;
-    const key = this.tail.key;
-    this.removeNode(this.tail);
-    this.map.delete(key);
+  private prependNode(node: LRUNode<T>): void {
+    node.prev = null;
+    node.next = this.head;
+    if (this.head) this.head.prev = node;
+    this.head = node;
+    if (!this.tail) this.tail = node;
   }
 }
 

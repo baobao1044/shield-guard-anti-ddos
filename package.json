@@ -6,7 +6,11 @@
   "scripts": {
     "build": "esbuild src/main.ts --bundle --platform=node --target=node18 --outfile=shield.js --minify",
     "build:dev": "esbuild src/main.ts --bundle --platform=node --target=node18 --outfile=shield.js --sourcemap",
-    "dev": "ts-node src/main.ts"
+    "dev": "ts-node src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test:integration": "node tests/run-integration.mjs",
+    "test:smoke": "node tests/run-smoke.mjs",
+    "test": "npm run build && npm run typecheck && npm run test:integration"
   },
   "dependencies": {
     "http-proxy": "^1.18.1",

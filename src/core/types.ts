@@ -52,9 +52,12 @@ export interface HTTPRequest {
   ip: string;
   method: string;
   url: string;
+  rawUrl?: string;
   headers: Record<string, string>;
   body?: string;
   contentLength?: number;
+  bodySize?: number;
+  hasBody?: boolean;
   userAgent?: string;
   timestamp: number;
 }
@@ -103,8 +106,10 @@ export interface ShieldMetrics {
   currentRPS: number;
   activeConnections: number;
   blacklistedIPs: number;
+  emergencyMode: boolean;
   threatsByLayer: { l3: number; l4: number; l7: number };
   topAttackVectors: Array<{ vector: string; count: number }>;
+  topReasonCodes: Array<{ code: string; count: number }>;
   uptimeMs: number;
 }
 
@@ -220,6 +225,8 @@ export interface ServerConfig {
   target: string;
   port: number;
   httpsPort?: number;
+  trustedProxies?: string[];
+  trustForwardedHeaders?: boolean;
   tls?: TLSConfig;
   dashboardPassword?: string;
   shield?: Partial<ShieldConfig>;

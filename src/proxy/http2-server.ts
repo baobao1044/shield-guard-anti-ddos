@@ -10,6 +10,7 @@ import { HTTPRequest, Action, ServerConfig } from '../core/types';
 import { Logger } from '../utils/logger';
 import { LRUCache, SlidingWindowCounter } from '../utils/data-structures';
 import { UnderAttackMode } from '../layers/uam';
+import { TLSGuard, DEFAULT_TLS_GUARD_CONFIG } from '../layers/tls-guard';
 import { renderDashboard, handleDashboardAPI } from '../dashboard/dashboard';
 import httpProxy from 'http-proxy';
 
@@ -18,8 +19,10 @@ const log = new Logger('HTTP2');
 interface SessionState {
   ip: string;
   streamCount: number;
+  activeStreams: number;
   resetCount: number;
   resetRateCounter: SlidingWindowCounter;
+  streamRateCounter: SlidingWindowCounter;
   blocked: boolean;
   createdAt: number;
 }
@@ -98,6 +101,7 @@ export function createHttp2Server(
 
   // Per-IP reset tracking (across sessions)
   const ipResetCounters = new LRUCache<SlidingWindowCounter>(100000, 60000);
+  const ipStreamCounters = new LRUCache<SlidingWindowCounter>(100000, 60000);
   const blockedIPs = new LRUCache<boolean>(100000, 300000); // 5 min block
 
   const server = http2.createSecureServer({
@@ -107,19 +111,26 @@ export function createHttp2Server(
     },
     allowHTTP1: true, // Fallback for HTTP/1.1 clients
   });
+  const tlsGuard = new TLSGuard({
+    ...DEFAULT_TLS_GUARD_CONFIG,
+    ...config.tlsGuard,
+  });
+  tlsGuard.attach(server);
 
   server.on('session', (session) => {
     const state: SessionState = {
       ip: (session.socket.remoteAddress ?? '0.0.0.0'),
       streamCount: 0,
+      activeStreams: 0,
       resetCount: 0,
       resetRateCounter: new SlidingWindowCounter(1000),
+      streamRateCounter: new SlidingWindowCounter(1000),
       blocked: false,
       createdAt: Date.now(),
     };
 
     // === Per-IP block check ===
-    if (blockedIPs.get(state.ip)) {
+    if (blockedIPs.get(state.ip) || tlsGuard.isBlocked(state.ip)) {
       log.warn(`Blocked IP ${state.ip} tried HTTP/2 connection`);
       session.destroy();
       return;
@@ -127,11 +138,31 @@ export function createHttp2Server(
 
     session.on('stream', (stream, headers) => {
       state.streamCount++;
+      state.activeStreams++;
+      state.streamRateCounter.increment(Date.now());
+
+      let ipStreamCounter = ipStreamCounters.get(state.ip);
+      if (!ipStreamCounter) {
+        ipStreamCounter = new SlidingWindowCounter(1000);
+        ipStreamCounters.set(state.ip, ipStreamCounter);
+      }
+      ipStreamCounter.increment(Date.now());
+
+      const sessionStreamRate = state.streamRateCounter.getRate();
+      const ipStreamRate = ipStreamCounter.getRate();
+      if (sessionStreamRate > http2Config.maxStreamsPerSec || ipStreamRate > http2Config.maxStreamsPerSec * 2) {
+        blockedIPs.set(state.ip, true);
+        stream.respond({ ':status': 429 });
+        stream.end('Too Many Streams');
+        session.destroy();
+        return;
+      }
 
       const streamCreatedAt = Date.now();
 
       // Rapid Reset: track RST_STREAM events
       stream.on('aborted', () => {
+        state.activeStreams = Math.max(0, state.activeStreams - 1);
         const elapsed = Date.now() - streamCreatedAt;
 
         // Fast RST (< 100ms after creation) = likely rapid reset attack
@@ -153,7 +184,6 @@ export function createHttp2Server(
           if (sessionResetRate > http2Config.maxResetPerSec || ipResetRate > http2Config.maxResetPerSec * 2) {
             state.blocked = true;
             blockedIPs.set(state.ip, true);
-            shield.blacklistIP(state.ip);
             log.warn(`HTTP/2 Rapid Reset attack detected - blocked ${state.ip}`, {
               sessionResets: state.resetCount,
               rate: sessionResetRate.toFixed(1),
@@ -168,6 +198,10 @@ export function createHttp2Server(
         stream.end('Blocked');
         return;
       }
+
+      stream.on('close', () => {
+        state.activeStreams = Math.max(0, state.activeStreams - 1);
+      });
 
       // === Build req-like object for shield ===
       const method = (headers[':method'] ?? 'GET').toUpperCase();
@@ -301,13 +335,6 @@ export function createHttp2Server(
     session.on('error', (err) => {
       log.debug('Session error', { ip: state.ip, message: err.message });
     });
-  });
-
-  // Track TLS handshake failures (see tls-guard.ts integration)
-  server.on('tlsClientError', (_err, socket) => {
-    const ip = socket.remoteAddress ?? '0.0.0.0';
-    log.debug('TLS client error', { ip });
-    socket.destroy();
   });
 
   server.listen(http2Config.port, () => {

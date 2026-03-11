@@ -1,154 +1,155 @@
 // ============================================================================
 // Terminal Live Stats (dstat) - Real-time attack monitor
-// Usage: node shield.js --target ... --port ... --dstat
-//        node shield.js --dstat-only --shield-url http://localhost:9994
 // ============================================================================
 
 import * as http from 'http';
 
-// ── ANSI helpers ──────────────────────────────────────────────────────────────
 const A = {
-  reset:   '\x1b[0m',
-  bold:    '\x1b[1m',
-  dim:     '\x1b[2m',
-  red:     '\x1b[31m',
-  green:   '\x1b[32m',
-  yellow:  '\x1b[33m',
-  blue:    '\x1b[34m',
+  reset: '\x1b[0m',
+  bold: '\x1b[1m',
+  dim: '\x1b[2m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
   magenta: '\x1b[35m',
-  cyan:    '\x1b[36m',
-  white:   '\x1b[37m',
-  gray:    '\x1b[90m',
-  bgRed:   '\x1b[41m',
-  bgGreen: '\x1b[42m',
-  bgBlue:  '\x1b[44m',
-  bgYellow:'\x1b[43m',
-  clear:   '\x1b[2J\x1b[H',
-  home:    '\x1b[H',
+  cyan: '\x1b[36m',
+  white: '\x1b[37m',
+  gray: '\x1b[90m',
+  clear: '\x1b[2J\x1b[H',
+  home: '\x1b[H',
   hideCursor: '\x1b[?25l',
   showCursor: '\x1b[?25h',
 };
 
-// Box drawing
-const B = {
-  tl: '╔', tr: '╗', bl: '╚', br: '╝',
-  h: '═', v: '║',
-  ml: '╠', mr: '╣', mt: '╦', mb: '╩', x: '╬',
-  sl: '├', sr: '┤', sh: '─', sv: '│',
-};
-
-function c(color: string, text: string): string {
-  return `${color}${text}${A.reset}`;
+function color(code: string, text: string): string {
+  return `${code}${text}${A.reset}`;
 }
 
-function pad(s: string | number, n: number, right = false): string {
-  const str = String(s);
-  const diff = n - stripAnsi(str).length;
-  if (diff <= 0) return str;
-  return right ? ' '.repeat(diff) + str : str + ' '.repeat(diff);
+function stripAnsi(value: string): string {
+  return value.replace(/\x1b\[[0-9;]*m/g, '');
 }
 
-function stripAnsi(s: string): string {
-  // eslint-disable-next-line no-control-regex
-  return s.replace(/\x1b\[[0-9;]*m/g, '');
+function pad(value: string | number, width: number, alignRight = false): string {
+  const text = String(value);
+  const delta = width - stripAnsi(text).length;
+  if (delta <= 0) return text;
+  return alignRight ? ' '.repeat(delta) + text : text + ' '.repeat(delta);
 }
 
-function fmt(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
-  if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'K';
-  return n.toString();
+function fmt(value: number): string {
+  if (value >= 1_000_000) return (value / 1_000_000).toFixed(1) + 'M';
+  if (value >= 1_000) return (value / 1_000).toFixed(1) + 'K';
+  return String(Math.round(value));
+}
+
+function fmtRate(value: number): string {
+  return fmt(Math.max(0, value));
 }
 
 function fmtUptime(ms: number): string {
-  const s = Math.floor(ms / 1000);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  if (h > 0) return `${h}h ${m}m ${sec}s`;
-  if (m > 0) return `${m}m ${sec}s`;
-  return `${sec}s`;
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
 }
 
-function fmtTime(ts: number): string {
-  return new Date(ts).toTimeString().substring(0, 8);
+function formatClock(ts: number): string {
+  return new Date(ts).toTimeString().slice(0, 8);
 }
 
-function bar(val: number, max: number, width: number, color: string): string {
-  if (max === 0) max = 1;
-  const filled = Math.round((val / max) * width);
-  const empty = width - filled;
-  return c(color, '█'.repeat(Math.max(0, filled))) + c(A.gray, '░'.repeat(Math.max(0, empty)));
+function pct(part: number, total: number): string {
+  return (((part || 0) / (total || 1)) * 100).toFixed(1) + '%';
 }
 
-function threatColor(level: number): string {
-  if (level >= 4) return A.bgRed + A.white + A.bold;
-  if (level >= 3) return A.red + A.bold;
-  if (level >= 2) return A.yellow + A.bold;
-  if (level >= 1) return A.cyan;
-  return A.gray;
+function hr(char: string, width: number): string {
+  return char.repeat(Math.max(0, width));
 }
 
-function threatLabel(level: number): string {
-  const labels = ['NONE    ', 'LOW     ', 'MEDIUM  ', 'HIGH    ', 'CRITICAL'];
-  return labels[Math.min(level, 4)];
+function colorAction(action: string): string {
+  switch (action) {
+    case 'DROP':
+    case 'BLACKHOLE':
+      return A.red;
+    case 'RATE_LIMIT':
+      return A.yellow;
+    case 'CHALLENGE':
+      return A.cyan;
+    default:
+      return A.gray;
+  }
 }
 
-function layerColor(layer: string): string {
-  if (layer === 'L3') return A.blue;
-  if (layer === 'L4') return A.green;
-  if (layer === 'L7') return A.magenta;
-  return A.gray;
+function colorLayer(layer: string): string {
+  switch (layer) {
+    case 'L3':
+      return A.blue;
+    case 'L4':
+      return A.green;
+    case 'L7':
+      return A.magenta;
+    default:
+      return A.gray;
+  }
 }
 
-function actionColor(action: string): string {
-  if (action === 'DROP' || action === 'BLACKHOLE') return A.red;
-  if (action === 'RATE_LIMIT') return A.yellow;
-  if (action === 'CHALLENGE') return A.cyan;
-  return A.gray;
+function bar(value: number, max: number, width: number, activeColor: string): string {
+  const filled = Math.round((Math.max(0, value) / Math.max(1, max)) * width);
+  const empty = Math.max(0, width - filled);
+  return color(activeColor, '#'.repeat(filled)) + color(A.gray, '.'.repeat(empty));
 }
 
-// ── Fetch helpers ─────────────────────────────────────────────────────────────
-
-function fetchJSON(url: string): Promise<unknown> {
+function fetchJSON<T>(url: string): Promise<T> {
   return new Promise((resolve, reject) => {
-    http.get(url, (res) => {
+    const req = http.get(url, (res) => {
       let data = '';
-      res.on('data', (c: Buffer) => data += c);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch { reject(new Error('Invalid JSON')); }
+      res.on('data', (chunk: Buffer | string) => {
+        data += chunk.toString();
       });
-    }).on('error', reject).setTimeout(2000, function() { this.destroy(); });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data) as T);
+        } catch {
+          reject(new Error('Invalid JSON'));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(2000, () => {
+      req.destroy(new Error('Request timed out'));
+    });
   });
 }
 
-// ── RPS Sparkline ─────────────────────────────────────────────────────────────
-
 class Sparkline {
-  private history: number[] = [];
-  private readonly maxPoints: number;
+  private readonly history: number[] = [];
 
-  constructor(maxPoints = 60) {
-    this.maxPoints = maxPoints;
-  }
+  constructor(private readonly maxPoints = 60) {}
 
-  push(val: number): void {
-    this.history.push(val);
+  push(value: number): void {
+    this.history.push(value);
     if (this.history.length > this.maxPoints) this.history.shift();
   }
 
   render(width: number): string {
-    const CHARS = ' ▁▂▃▄▅▆▇█';
+    const chars = ' .:-=+*#%@';
     const data = this.history.slice(-width);
+    if (data.length === 0) return ''.padEnd(width, ' ');
     const max = Math.max(...data, 1);
-    return data.map(v => {
-      const idx = Math.min(8, Math.floor((v / max) * 8));
-      return c(v > max * 0.8 ? A.red : v > max * 0.5 ? A.yellow : A.green, CHARS[idx]);
+
+    return data.map((item) => {
+      const idx = Math.min(chars.length - 1, Math.floor((item / max) * (chars.length - 1)));
+      const glyph = chars[idx];
+      if (item > max * 0.85) return color(A.red, glyph);
+      if (item > max * 0.55) return color(A.yellow, glyph);
+      return color(A.green, glyph);
     }).join('');
   }
 }
-
-// ── Main DstatMonitor ─────────────────────────────────────────────────────────
 
 interface Metrics {
   totalPackets: number;
@@ -159,62 +160,65 @@ interface Metrics {
   avgProcessingTimeUs: number;
   peakRPS: number;
   currentRPS: number;
-  threatsByLayer: { l3: number; l4: number; l7: number };
-  topAttackVectors: Array<{ vector: string; count: number }>;
-  uptimeMs: number;
+  activeConnections?: number;
+  blacklistedIPs?: number;
+  emergencyMode?: boolean;
   uamActive?: boolean;
+  threatsByLayer: { l3: number; l4: number; l7: number };
+  topAttackVectors?: Array<{ vector: string; count: number }>;
+  topReasonCodes?: Array<{ code: string; count: number }>;
+  uptimeMs: number;
 }
 
 interface BlockEvent {
   ts: number;
   ip: string;
+  method?: string;
+  path?: string;
   layer: string;
+  reasonCode?: string;
   reason: string;
   action: string;
   threatLevel: number;
-  url?: string;
 }
 
 export class DstatMonitor {
-  private readonly shieldUrl: string;
-  private readonly refreshMs: number;
-  private sparkline = new Sparkline(60);
+  private readonly sparkline = new Sparkline(80);
   private prevMetrics: Metrics | null = null;
-  private prevDropped = 0;
-  private prevAllowed = 0;
-  private blockRate = 0;
   private allowRate = 0;
+  private dropRate = 0;
+  private limitRate = 0;
+  private challengeRate = 0;
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
   private cols = 120;
   private rows = 40;
 
-  constructor(shieldUrl: string, refreshMs = 1000) {
-    this.shieldUrl = shieldUrl;
-    this.refreshMs = refreshMs;
-  }
+  constructor(
+    private readonly shieldUrl: string,
+    private readonly refreshMs = 1000,
+  ) {}
 
   start(): void {
-    // Hide cursor, clear screen
     process.stdout.write(A.hideCursor + A.clear);
+    this.cols = process.stdout.columns ?? 120;
+    this.rows = process.stdout.rows ?? 40;
 
-    // Handle resize
     process.stdout.on('resize', () => {
       this.cols = process.stdout.columns ?? 120;
       this.rows = process.stdout.rows ?? 40;
     });
-    this.cols = process.stdout.columns ?? 120;
-    this.rows = process.stdout.rows ?? 40;
 
-    // Restore cursor on exit
     const cleanup = () => {
-      process.stdout.write(A.showCursor + A.clear);
+      this.stop();
+      process.stdout.write(A.clear);
       process.exit(0);
     };
+
     process.on('SIGINT', cleanup);
     process.on('SIGTERM', cleanup);
 
-    this.intervalHandle = setInterval(() => this.refresh(), this.refreshMs);
-    this.refresh();
+    this.intervalHandle = setInterval(() => void this.refresh(), this.refreshMs);
+    void this.refresh();
   }
 
   stop(): void {
@@ -225,176 +229,144 @@ export class DstatMonitor {
   private async refresh(): Promise<void> {
     try {
       const [metrics, events] = await Promise.all([
-        fetchJSON(`${this.shieldUrl}/shield-api/metrics`) as Promise<Metrics>,
-        fetchJSON(`${this.shieldUrl}/shield-api/events?limit=20`) as Promise<BlockEvent[]>,
+        fetchJSON<Metrics>(`${this.shieldUrl}/shield-api/metrics`),
+        fetchJSON<BlockEvent[]>(`${this.shieldUrl}/shield-api/events?limit=20`),
       ]);
 
-      this.sparkline.push(metrics.currentRPS);
-
-      // Calculate per-second rates
+      this.sparkline.push(metrics.currentRPS || 0);
       if (this.prevMetrics) {
-        this.blockRate = metrics.totalDropped - this.prevDropped;
-        this.allowRate = metrics.totalAllowed - this.prevAllowed;
+        this.allowRate = metrics.totalAllowed - this.prevMetrics.totalAllowed;
+        this.dropRate = metrics.totalDropped - this.prevMetrics.totalDropped;
+        this.limitRate = metrics.totalRateLimited - this.prevMetrics.totalRateLimited;
+        this.challengeRate = metrics.totalChallenged - this.prevMetrics.totalChallenged;
       }
-      this.prevDropped = metrics.totalDropped;
-      this.prevAllowed = metrics.totalAllowed;
       this.prevMetrics = metrics;
 
-      this.render(metrics, events);
-    } catch {
-      process.stdout.write(A.home);
-      process.stdout.write(c(A.red, `\n  ⚠ Cannot connect to Shield Guard at ${this.shieldUrl}\n`));
-      process.stdout.write(c(A.gray, `  Retrying in ${this.refreshMs / 1000}s...\n`));
+      this.renderOnline(metrics, events);
+    } catch (error) {
+      this.renderOffline(error instanceof Error ? error.message : 'Unknown error');
     }
   }
 
-  private render(m: Metrics, events: BlockEvent[]): void {
-    const W = Math.max(80, Math.min(this.cols, 160));
+  private renderOnline(metrics: Metrics, events: BlockEvent[]): void {
+    const width = Math.max(90, Math.min(this.cols, 160));
     const lines: string[] = [];
+    const total = Math.max(1, metrics.totalPackets);
+    const reasons = metrics.topReasonCodes ?? [];
+    const maxThreat = Math.max(metrics.threatsByLayer.l3, metrics.threatsByLayer.l4, metrics.threatsByLayer.l7, 1);
+    const sparkWidth = Math.max(20, width - 55);
 
-    const line = (s = '') => lines.push(s);
-    const box = (content: string) => `${B.v} ${content} ${B.v}`;
+    lines.push(color(A.cyan, hr('=', width)));
 
-    // ── Header ─────────────────────────────────────────────────────────────
-
-    const title = ` 🛡️  SHIELD GUARD  ${A.gray}─${A.reset} LIVE ATTACK MONITOR `;
-    const now = new Date().toLocaleTimeString();
-    const uamBadge = m.uamActive
-      ? c(A.bgRed + A.white + A.bold, ' UAM ON ')
-      : c(A.bgGreen + A.white, ' UAM OFF');
-    const headerRight = `${uamBadge}  ${c(A.gray, now)} `;
-    const headerPad = W - 4 - stripAnsi(title).length - stripAnsi(headerRight).length;
-
-    line(c(A.cyan, B.tl + B.h.repeat(W - 2) + B.tr));
-    line(c(A.cyan, B.v) + c(A.bold + A.cyan, title) + ' '.repeat(Math.max(0, headerPad)) + headerRight + c(A.cyan, B.v));
-    line(c(A.cyan, B.ml + B.h.repeat(W - 2) + B.mr));
-
-    // ── RPS + Sparkline ────────────────────────────────────────────────────
-
-    const rpsVal = m.currentRPS;
-    const rpsColor = rpsVal > 10000 ? A.red : rpsVal > 1000 ? A.yellow : A.green;
-    const rpsStr = c(rpsColor + A.bold, fmt(rpsVal).padStart(8));
-    const peakStr = c(A.gray, `peak: ${fmt(m.peakRPS)}`);
-    const sparkW = W - 40;
-    const spark = this.sparkline.render(sparkW);
-    const rpsLine = ` RPS ${rpsStr} /s  ${peakStr}  ${spark}`;
-    line(c(A.cyan, B.v) + pad(rpsLine, W - 2) + c(A.cyan, B.v));
-
-    // ── 5 stat boxes ──────────────────────────────────────────────────────
-
-    line(c(A.cyan, B.ml + B.h.repeat(W - 2) + B.mr));
-
-    const colW = Math.floor((W - 7) / 5);
-    const stats = [
-      { label: 'TOTAL     ', val: fmt(m.totalPackets),     color: A.white },
-      { label: 'ALLOWED ✓ ', val: fmt(m.totalAllowed),     color: A.green },
-      { label: 'BLOCKED ✗ ', val: fmt(m.totalDropped),     color: A.red   },
-      { label: 'RATE LTD ⚡', val: fmt(m.totalRateLimited), color: A.yellow},
-      { label: 'CHALLENGED', val: fmt(m.totalChallenged),  color: A.cyan  },
-    ];
-
-    const labelRow = stats.map(s => c(A.dim, pad(s.label, colW))).join(c(A.cyan, B.sv));
-    const valRow   = stats.map(s => c(s.color + A.bold, pad(s.val, colW, false))).join(c(A.cyan, B.sv));
-
-    line(c(A.cyan, B.v) + ' ' + labelRow + ' ' + c(A.cyan, B.v));
-    line(c(A.cyan, B.v) + ' ' + valRow   + ' ' + c(A.cyan, B.v));
-
-    // Rate line
-    const rateStr = `  ${c(A.dim, 'Δ/s')}  ${c(A.green, '+' + fmt(this.allowRate))}  ${c(A.red, '-' + fmt(this.blockRate))}  ${c(A.gray, `avg ${m.avgProcessingTimeUs.toFixed(1)}µs`)}  ${c(A.gray, `uptime ${fmtUptime(m.uptimeMs)}`)}`;
-    line(c(A.cyan, B.v) + pad(rateStr, W - 2) + c(A.cyan, B.v));
-
-    // ── Threat bars ───────────────────────────────────────────────────────
-
-    line(c(A.cyan, B.ml + B.h.repeat(W - 2) + B.mr));
-
-    const totalThreats = m.threatsByLayer.l3 + m.threatsByLayer.l4 + m.threatsByLayer.l7;
-    const barW = Math.floor((W - 30) / 3);
-    const threatLine = [
-      c(A.blue  + A.bold, ' L3 ') + c(A.blue,   pad(fmt(m.threatsByLayer.l3), 7, true)) + ' ' + bar(m.threatsByLayer.l3, totalThreats, barW, A.blue),
-      c(A.green + A.bold, ' L4 ') + c(A.green,  pad(fmt(m.threatsByLayer.l4), 7, true)) + ' ' + bar(m.threatsByLayer.l4, totalThreats, barW, A.green),
-      c(A.magenta + A.bold, ' L7 ') + c(A.magenta, pad(fmt(m.threatsByLayer.l7), 7, true)) + ' ' + bar(m.threatsByLayer.l7, totalThreats, barW, A.magenta),
+    const headerLeft = `${color(A.bold + A.cyan, 'SHIELD GUARD')} live monitor`;
+    const headerRight = [
+      metrics.uamActive ? color(A.yellow, 'UAM ON') : color(A.green, 'UAM OFF'),
+      metrics.emergencyMode ? color(A.red, 'EMERGENCY') : color(A.gray, 'steady'),
+      color(A.gray, new Date().toLocaleTimeString()),
     ].join('  ');
+    lines.push(
+      headerLeft +
+      ' '.repeat(Math.max(1, width - stripAnsi(headerLeft).length - stripAnsi(headerRight).length)) +
+      headerRight,
+    );
+    lines.push(color(A.cyan, hr('-', width)));
 
-    line(c(A.cyan, B.v) + pad(threatLine, W - 2) + c(A.cyan, B.v));
+    const rpsValue = color(
+      metrics.currentRPS > 1000 ? A.red + A.bold : metrics.currentRPS > 200 ? A.yellow + A.bold : A.green + A.bold,
+      pad(fmt(metrics.currentRPS), 8, true),
+    );
+    lines.push(`RPS ${rpsValue} /s  peak ${fmt(metrics.peakRPS)}  ${this.sparkline.render(sparkWidth)}`);
+    lines.push(color(A.cyan, hr('-', width)));
 
-    // ── Top attack vectors ────────────────────────────────────────────────
+    const summary = [
+      `${color(A.blue, 'TOTAL')} ${pad(fmt(metrics.totalPackets), 8, true)}`,
+      `${color(A.green, 'ALLOW')} ${pad(fmt(metrics.totalAllowed), 8, true)} (${pct(metrics.totalAllowed, total)})`,
+      `${color(A.red, 'DROP ')} ${pad(fmt(metrics.totalDropped), 8, true)} (${pct(metrics.totalDropped, total)})`,
+      `${color(A.yellow, 'LIMIT')} ${pad(fmt(metrics.totalRateLimited), 8, true)} (${pct(metrics.totalRateLimited, total)})`,
+      `${color(A.cyan, 'CHAL ')} ${pad(fmt(metrics.totalChallenged), 8, true)} (${pct(metrics.totalChallenged, total)})`,
+    ];
+    lines.push(summary.join('   '));
+    lines.push(
+      `${color(A.gray, 'Delta/s')} +${fmtRate(this.allowRate)} allow  -${fmtRate(this.dropRate)} drop  ` +
+      `${fmtRate(this.limitRate)} limit  ${fmtRate(this.challengeRate)} challenge`,
+    );
+    lines.push(
+      `${color(A.gray, 'Runtime')} conns ${fmt(metrics.activeConnections ?? 0)}  ` +
+      `blacklist ${fmt(metrics.blacklistedIPs ?? 0)}  avg ${(metrics.avgProcessingTimeUs || 0).toFixed(1)} us  ` +
+      `uptime ${fmtUptime(metrics.uptimeMs)}`,
+    );
+    lines.push(color(A.cyan, hr('-', width)));
 
-    line(c(A.cyan, B.ml + B.h.repeat(W - 2) + B.mr));
-    line(c(A.cyan, B.v) + c(A.bold + A.white, ' TOP ATTACK VECTORS') + pad('', W - 21) + c(A.cyan, B.v));
+    lines.push(
+      `Threats  L3 ${pad(fmt(metrics.threatsByLayer.l3), 6, true)} ${bar(metrics.threatsByLayer.l3, maxThreat, 14, A.blue)}  ` +
+      `L4 ${pad(fmt(metrics.threatsByLayer.l4), 6, true)} ${bar(metrics.threatsByLayer.l4, maxThreat, 14, A.green)}  ` +
+      `L7 ${pad(fmt(metrics.threatsByLayer.l7), 6, true)} ${bar(metrics.threatsByLayer.l7, maxThreat, 14, A.magenta)}`,
+    );
+    lines.push(color(A.cyan, hr('-', width)));
 
-    const maxVec = m.topAttackVectors[0]?.count ?? 1;
-    const vecBarW = Math.floor((W - 50) / 2);
-    const vecRows = Math.min(5, m.topAttackVectors.length);
-
-    for (let i = 0; i < Math.max(vecRows, 3); i++) {
-      const v = m.topAttackVectors[i];
-      if (v) {
-        const [layer, ...rest] = v.vector.split(':');
-        const reason = rest.join(':').substring(0, W - 30);
-        const layerTag = c(layerColor(layer) + A.bold, ` [${layer}]`);
-        const countStr = c(A.yellow + A.bold, pad(fmt(v.count), 8, true));
-        const b = bar(v.count, maxVec, vecBarW, A.red);
-        const row = `${layerTag} ${pad(reason, W - 40)} ${countStr} ${b}`;
-        line(c(A.cyan, B.v) + pad(row, W - 2) + c(A.cyan, B.v));
-      } else {
-        line(c(A.cyan, B.v) + pad(c(A.gray, '  —'), W - 2) + c(A.cyan, B.v));
+    lines.push(color(A.bold + A.white, 'Top reason codes'));
+    if (reasons.length === 0) {
+      lines.push(color(A.gray, '  none yet'));
+    } else {
+      for (const entry of reasons.slice(0, 6)) {
+        lines.push(`  ${pad(entry.code, Math.max(20, width - 16))} ${pad(fmt(entry.count), 8, true)}`);
       }
     }
 
-    // ── Live event feed ───────────────────────────────────────────────────
+    lines.push(color(A.cyan, hr('-', width)));
+    lines.push(color(A.bold + A.white, 'Recent events'));
 
-    line(c(A.cyan, B.ml + B.h.repeat(W - 2) + B.mr));
-
-    const feedTitle = ' LIVE BLOCK FEED';
-    const feedRows = Math.max(5, this.rows - lines.length - 4);
-    line(c(A.cyan, B.v) + c(A.bold + A.white, feedTitle) + pad('', W - feedTitle.length - 2) + c(A.cyan, B.v));
-
-    const visible = events.slice(0, feedRows);
-
-    for (let i = 0; i < feedRows; i++) {
-      const ev = visible[i];
-      if (ev) {
-        const time   = c(A.gray,  fmtTime(ev.ts));
-        const ip     = c(A.white + A.bold, pad(ev.ip, 16));
-        const layer  = c(layerColor(ev.layer)  + A.bold, pad(ev.layer, 4));
-        const act    = c(actionColor(ev.action), pad(ev.action, 11));
-        const threat = c(threatColor(ev.threatLevel), threatLabel(ev.threatLevel));
-        const url    = ev.url ? c(A.gray, ' ' + ev.url.substring(0, 25)) : '';
-        const reason = c(A.dim, ev.reason.substring(0, W - 80));
-        const row    = ` ${time}  ${ip} ${layer} ${act} ${threat} ${reason}${url}`;
-        line(c(A.cyan, B.v) + pad(row, W - 2) + c(A.cyan, B.v));
-      } else {
-        line(c(A.cyan, B.v) + pad('', W - 2) + c(A.cyan, B.v));
+    const feedRows = Math.max(5, Math.min(12, this.rows - lines.length - 3));
+    const visibleEvents = events.slice(0, feedRows);
+    if (visibleEvents.length === 0) {
+      lines.push(color(A.gray, '  no events'));
+    } else {
+      for (const event of visibleEvents) {
+        const stamp = color(A.gray, formatClock(event.ts));
+        const layer = color(colorLayer(event.layer) + A.bold, pad(event.layer, 3));
+        const action = color(colorAction(event.action), pad(event.action, 10));
+        const ip = pad(event.ip, 18);
+        const reasonCode = event.reasonCode ? ` ${color(A.cyan, '[' + event.reasonCode + ']')}` : '';
+        const detail = event.path ? color(A.gray, ' ' + event.path) : '';
+        const remaining = Math.max(10, width - 52);
+        const reasonText = (event.reason || '').slice(0, remaining);
+        lines.push(`${stamp} ${ip} ${layer} ${action} ${reasonText}${reasonCode}${detail}`);
       }
     }
 
-    // ── Footer ─────────────────────────────────────────────────────────────
+    lines.push(color(A.cyan, hr('=', width)));
+    lines.push(color(A.gray, `${this.shieldUrl}  refresh ${this.refreshMs}ms  press q to quit`));
 
-    const footer = ` ${c(A.gray, 'q')} quit  ${c(A.gray, 'Ctrl+C')} exit  ${c(A.cyan, this.shieldUrl)}  refresh ${this.refreshMs}ms `;
-    line(c(A.cyan, B.bl + B.h.repeat(W - 2) + B.br));
-    line(c(A.gray, footer));
+    process.stdout.write(A.home + A.clear);
+    process.stdout.write(lines.join('\n') + '\n');
+  }
 
-    // ── Write to terminal ──────────────────────────────────────────────────
-
-    process.stdout.write(A.home);
+  private renderOffline(reason: string): void {
+    const width = Math.max(70, Math.min(this.cols, 120));
+    const lines = [
+      color(A.red, hr('=', width)),
+      color(A.bold + A.red, 'SHIELD GUARD monitor offline'),
+      `Cannot connect to ${this.shieldUrl}`,
+      color(A.gray, `Reason: ${reason}`),
+      color(A.gray, `Retrying every ${this.refreshMs}ms`),
+      color(A.red, hr('=', width)),
+    ];
+    process.stdout.write(A.home + A.clear);
     process.stdout.write(lines.join('\n') + '\n');
   }
 }
-
-// ── Standalone mode (called from main.ts with --dstat-only) ──────────────────
 
 export function startDstat(shieldUrl: string, refreshMs = 1000): void {
   const monitor = new DstatMonitor(shieldUrl, refreshMs);
   monitor.start();
 
-  // Allow 'q' to quit
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.on('data', (key: Buffer) => {
       if (key.toString() === 'q' || key[0] === 3) {
         monitor.stop();
-        process.stdout.write(A.showCursor + A.clear);
+        process.stdout.write(A.clear);
         process.exit(0);
       }
     });

@@ -493,6 +493,8 @@ const TL_CLASS = ['tl-0','tl-1','tl-2','tl-3','tl-4'];
 function appendEvent(ev) {
   const feed = document.getElementById('feed');
   const time = new Date(ev.ts).toLocaleTimeString();
+  const detail = ev.path || ev.url || '';
+  const reasonCode = ev.reasonCode ? ' [' + ev.reasonCode + ']' : '';
   const row = document.createElement('div');
   row.className = 'feed-row ' + (TL_CLASS[ev.threatLevel] || 'tl-0');
   const action = ev.action.replace('_',' ');
@@ -502,8 +504,8 @@ function appendEvent(ev) {
     '<span class="feed-ip">' + (ev.ip||'?') + '</span>' +
     '<span class="feed-action ' + aClass + '">' + action + '</span>' +
     '<span class="feed-layer">' + ev.layer + '</span>' +
-    '<span class="feed-reason">' + ev.reason + '</span>' +
-    '<span class="feed-url" title="' + (ev.url||'') + '">' + (ev.url||'') + '</span>';
+    '<span class="feed-reason">' + ev.reason + reasonCode + '</span>' +
+    '<span class="feed-url" title="' + detail + '">' + detail + '</span>';
 
   feed.insertBefore(row, feed.firstChild);
   feedCount++;
@@ -600,6 +602,20 @@ async function pollMetrics() {
           '</div>';
       }).join('');
       document.getElementById('vectors').innerHTML = html;
+    } else if (m.topReasonCodes && m.topReasonCodes.length > 0) {
+      const maxV = m.topReasonCodes[0].count || 1;
+      const html = m.topReasonCodes.slice(0,5).map(v => {
+        const pct = (v.count/maxV*100).toFixed(0);
+        return '<div class="vector-row">' +
+          '<span class="vector-layer vl-l7">RC</span>' +
+          '<span class="vector-name">' + v.code + '</span>' +
+          '<div class="vector-bar-wrap"><div class="vector-bar" style="width:'+pct+'%;background:var(--orange)"></div></div>' +
+          '<span class="vector-count c-yellow">'+fmt(v.count)+'</span>' +
+          '</div>';
+      }).join('');
+      document.getElementById('vectors').innerHTML = html;
+    } else {
+      document.getElementById('vectors').innerHTML = '<div style="color:var(--muted);font-size:12px">No attacks detected yet...</div>';
     }
 
     // New events
