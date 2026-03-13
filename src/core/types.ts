@@ -234,4 +234,10 @@ export interface ServerConfig {
   http2?: Partial<import('../proxy/http2-server').Http2Config>;
   slowloris?: Partial<import('../layers/slowloris-guard').SlowlorisConfig>;
   tlsGuard?: Partial<import('../layers/tls-guard').TLSGuardConfig>;
+  anomaly?: Partial<import('../layers/anomaly-engine').AnomalyConfig>;
+  tarpit?: Partial<import('../layers/tarpit').TarpitConfig>;
+  correlation?: Partial<import('../layers/correlation-engine').CorrelationConfig>;
+  ja3?: Partial<import('../layers/ja3-fingerprint').JA3Config>;
+  geoip?: Partial<import('../layers/geoip').GeoIPConfig>;
+  wsStream?: Partial<import('../stats/ws-stream').WSStreamConfig>;
 }

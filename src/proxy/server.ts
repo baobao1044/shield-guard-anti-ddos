@@ -16,6 +16,9 @@ import { renderDemoPage } from '../demo/demo';
 import { UnderAttackMode, DEFAULT_UAM_CONFIG } from '../layers/uam';
 import { SlowlorisGuard, DEFAULT_SLOWLORIS_CONFIG } from '../layers/slowloris-guard';
 import { TLSGuard, DEFAULT_TLS_GUARD_CONFIG } from '../layers/tls-guard';
+import { TarpitSystem, DEFAULT_TARPIT_CONFIG } from '../layers/tarpit';
+import { JA3Fingerprinter, DEFAULT_JA3_CONFIG } from '../layers/ja3-fingerprint';
+import { WSStream, DEFAULT_WS_CONFIG } from '../stats/ws-stream';
 
 const log = new Logger('Proxy');
 const MAX_BODY_INSPECTION_BYTES = 1024 * 1024;
@@ -177,6 +180,26 @@ export function createProxyServer(
     ...config.tlsGuard,
   });
 
+  // === New Feature Modules ===
+
+  const tarpit = new TarpitSystem({
+    ...DEFAULT_TARPIT_CONFIG,
+    ...config.tarpit,
+  });
+
+  // Wire tarpit auto-blacklist to shield L3
+  tarpit.onBlacklist((ip) => shield.blacklistIP(ip));
+
+  const ja3 = new JA3Fingerprinter({
+    ...DEFAULT_JA3_CONFIG,
+    ...config.ja3,
+  });
+
+  const wsStream = new WSStream({
+    ...DEFAULT_WS_CONFIG,
+    ...config.wsStream,
+  });
+
   // === Proxy ===
 
   const proxy = httpProxy.createProxyServer({
@@ -223,6 +246,12 @@ export function createProxyServer(
     const method = req.method ?? 'GET';
 
     // === Internal endpoints (always bypass shield) ===
+
+    // === Honeypot check (before any other processing) ===
+    if (tarpit.isHoneypot(url)) {
+      tarpit.handleHoneypotHit(req, res, ip);
+      return;
+    }
 
     if (url.startsWith('/shield-demo')) {
       const baseUrl = `${req.headers['x-forwarded-proto'] ?? 'http'}://${req.headers['host'] ?? `localhost:${config.port}`}`;
@@ -380,6 +409,7 @@ export function createProxyServer(
   const httpServer = http.createServer(handleRequest);
   trackConnections(httpServer);
   slowloris.attach(httpServer); // hook slowloris detection at socket level
+  wsStream.attach(httpServer, shield); // attach WebSocket stream
   httpServer.listen(config.port, () => {
     log.success(`HTTP  listening on port ${config.port}`);
   });
@@ -393,6 +423,12 @@ export function createProxyServer(
 
     // Hook TLS guard for handshake tracking
     tlsGuard.attach(httpsServer);
+
+    // Hook JA3 fingerprinting on TLS
+    httpsServer.on('secureConnection', (socket) => {
+      ja3.extractFingerprint(socket);
+    });
+
     // Hook slowloris on HTTPS too
     slowloris.attach(httpsServer as unknown as http.Server);
 

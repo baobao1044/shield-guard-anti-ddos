@@ -11,6 +11,9 @@ import { DEFAULT_CONFIG } from './config';
 import { L3Filter } from '../layers/l3-filter';
 import { L4Filter } from '../layers/l4-filter';
 import { L7Filter } from '../layers/l7-filter';
+import { AnomalyEngine, DEFAULT_ANOMALY_CONFIG } from '../layers/anomaly-engine';
+import { CorrelationEngine, DEFAULT_CORRELATION_CONFIG } from '../layers/correlation-engine';
+import { GeoIPLookup, DEFAULT_GEOIP_CONFIG } from '../layers/geoip';
 import { SlidingWindowCounter, CircularBuffer } from '../utils/data-structures';
 import { Logger } from '../utils/logger';
 
@@ -35,6 +38,11 @@ export class AntiDDoSShield {
   readonly l3: L3Filter;
   readonly l4: L4Filter;
   readonly l7: L7Filter;
+
+  // New engines
+  readonly anomaly: AnomalyEngine;
+  readonly correlation: CorrelationEngine;
+  readonly geoip: GeoIPLookup;
 
   // Global metrics
   private totalPackets: number = 0;
@@ -65,13 +73,25 @@ export class AntiDDoSShield {
     activeConnections: 0,
   };
 
-  constructor(config?: Partial<ShieldConfig>) {
+  constructor(config?: Partial<ShieldConfig>, extraConfig?: {
+    anomaly?: Partial<import('../layers/anomaly-engine').AnomalyConfig>;
+    correlation?: Partial<import('../layers/correlation-engine').CorrelationConfig>;
+    geoip?: Partial<import('../layers/geoip').GeoIPConfig>;
+  }) {
     this.config = this.mergeConfig(config);
     this.log = new Logger('Shield', this.config.global.logLevel);
 
     this.l3 = new L3Filter(this.config.l3);
     this.l4 = new L4Filter(this.config.l4);
     this.l7 = new L7Filter(this.config.l7);
+
+    // Initialize new engines
+    this.anomaly = new AnomalyEngine({ ...DEFAULT_ANOMALY_CONFIG, ...extraConfig?.anomaly });
+    this.correlation = new CorrelationEngine({ ...DEFAULT_CORRELATION_CONFIG, ...extraConfig?.correlation });
+    this.geoip = new GeoIPLookup({ ...DEFAULT_GEOIP_CONFIG, ...extraConfig?.geoip });
+
+    // Wire auto-block callbacks
+    this.correlation.onAutoBlock((ip) => this.l3.addToBlacklist(ip));
 
     this.processingTimes = new CircularBuffer<number>(10000);
     this.recentEvents = new CircularBuffer<BlockEvent>(200);
@@ -85,6 +105,9 @@ export class AntiDDoSShield {
       l4: this.config.l4.enabled,
       l7: this.config.l7.enabled,
       adaptive: this.config.global.adaptiveMode,
+      anomaly: (extraConfig?.anomaly?.enabled !== false),
+      correlation: (extraConfig?.correlation?.enabled !== false),
+      geoip: (extraConfig?.geoip?.enabled ?? false),
     });
   }
 
@@ -161,6 +184,7 @@ export class AntiDDoSShield {
 
     // Whitelist bypass
     if (this.whitelist.has(request.ip)) {
+      this.anomaly.recordRequest(request.ip, request.method, request.url, request.contentLength || 0, false);
       return {
         action: Action.ALLOW,
         reason: 'Whitelisted IP',
@@ -172,6 +196,7 @@ export class AntiDDoSShield {
 
     if (this.emergencyMode) {
       this.totalDropped++;
+      this.anomaly.recordRequest(request.ip, request.method, request.url, request.contentLength || 0, true);
       return {
         action: Action.DROP,
         reason: 'Emergency mode active',
@@ -179,6 +204,33 @@ export class AntiDDoSShield {
         threatLevel: ThreatLevel.CRITICAL,
         processingTimeUs: 0,
       };
+    }
+
+    // GeoIP check
+    const geoResult = this.geoip.lookup(request.ip);
+    if (geoResult.action === 'block') {
+      const result: FilterResult = {
+        action: Action.DROP,
+        reason: `Blocked country: ${geoResult.countryName} (${geoResult.countryCode})`,
+        layer: 'GEO',
+        threatLevel: ThreatLevel.MEDIUM,
+        processingTimeUs: 0,
+      };
+      this.recordResult(result, request.ip, request.method, request.url);
+      this.anomaly.recordRequest(request.ip, request.method, request.url, request.contentLength || 0, true);
+      return result;
+    }
+    if (geoResult.action === 'challenge') {
+      const result: FilterResult = {
+        action: Action.CHALLENGE,
+        reason: `Challenge country: ${geoResult.countryName} (${geoResult.countryCode})`,
+        layer: 'GEO',
+        threatLevel: ThreatLevel.LOW,
+        processingTimeUs: 0,
+        metadata: { challengeType: 'uam', geoCountry: geoResult.countryCode },
+      };
+      this.recordResult(result, request.ip, request.method, request.url);
+      return result;
     }
 
     // L3 check on IP
@@ -195,24 +247,58 @@ export class AntiDDoSShield {
       const l3Result = this.l3.process(l3Packet);
       if (l3Result.action !== Action.ALLOW) {
         this.recordResult(l3Result, request.ip, request.method, request.url);
+        this.anomaly.recordRequest(request.ip, request.method, request.url, request.contentLength || 0, true);
         return l3Result;
       }
     }
+
+    // Correlation check — get bot score boost from coordinated attack detection
+    const correlationBoost = this.correlation.recordRequest(
+      request.ip,
+      request.method,
+      request.url,
+      Object.keys(request.headers),
+      request.userAgent || '',
+    );
 
     // L7 Processing
     if (this.config.l7.enabled) {
       const l7Result = this.l7.process(request);
       if (l7Result.action !== Action.ALLOW) {
         this.recordResult(l7Result, request.ip, request.method, request.url);
+        this.anomaly.recordRequest(request.ip, request.method, request.url, request.contentLength || 0, true);
         return l7Result;
       }
+    }
+
+    // If correlation flagged this IP, escalate to challenge
+    if (correlationBoost >= 50) {
+      const result: FilterResult = {
+        action: Action.CHALLENGE,
+        reason: `Coordinated attack pattern (boost: ${correlationBoost})`,
+        layer: 'CORRELATION',
+        threatLevel: ThreatLevel.HIGH,
+        processingTimeUs: 0,
+        metadata: { correlationBoost },
+      };
+      this.recordResult(result, request.ip, request.method, request.url);
+      return result;
     }
 
     if (this.config.global.adaptiveMode) {
       this.checkAdaptive();
     }
 
+    // Check anomaly engine suggestion
+    const anomalyResult = this.anomaly.getLastResult();
+    if (anomalyResult.suggestedAction === 'emergency' && !this.emergencyMode) {
+      this.emergencyMode = true;
+      this.log.error(`EMERGENCY MODE via anomaly detection — score: ${anomalyResult.score}`);
+      setTimeout(() => { this.emergencyMode = false; }, 30000).unref();
+    }
+
     this.totalAllowed++;
+    this.anomaly.recordRequest(request.ip, request.method, request.url, request.contentLength || 0, false);
     return {
       action: Action.ALLOW,
       reason: 'Request passed all filters',
@@ -370,6 +456,9 @@ export class AntiDDoSShield {
       l3: this.l3.getStats(),
       l4: this.l4.getStats(),
       l7: this.l7.getStats(),
+      anomaly: this.anomaly.getStats(),
+      correlation: this.correlation.getStats(),
+      geoip: this.geoip.getStats(),
     };
   }
 

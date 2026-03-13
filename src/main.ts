@@ -189,7 +189,11 @@ function main(): void {
 
   printBannerClean(config);
 
-  const shield = new AntiDDoSShield(config.shield);
+  const shield = new AntiDDoSShield(config.shield, {
+    anomaly: config.anomaly,
+    correlation: config.correlation,
+    geoip: config.geoip,
+  });
   const { uam } = createProxyServer(config, shield);
 
   // Start terminal dstat if --dstat flag

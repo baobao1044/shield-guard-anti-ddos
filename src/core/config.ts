@@ -392,6 +392,58 @@ export function normalizeServerConfig(raw: Partial<ServerConfig>): ServerConfig 
     minTLSVersion: record.minTLSVersion === undefined ? undefined : readString(record.minTLSVersion, `${path}.minTLSVersion`),
   }));
 
+  const anomaly = validateOptionalObject(raw.anomaly, 'anomaly', (record, path) => ({
+    enabled: record.enabled === undefined ? undefined : readBoolean(record.enabled, `${path}.enabled`),
+    learningPeriodMs: record.learningPeriodMs === undefined ? undefined : readNumber(record.learningPeriodMs, `${path}.learningPeriodMs`, { integer: true, min: 0 }),
+    snapshotIntervalMs: record.snapshotIntervalMs === undefined ? undefined : readNumber(record.snapshotIntervalMs, `${path}.snapshotIntervalMs`, { integer: true, min: 100 }),
+    emaAlpha: record.emaAlpha === undefined ? undefined : readNumber(record.emaAlpha, `${path}.emaAlpha`, { min: 0.001, max: 1 }),
+    zScoreThreshold: record.zScoreThreshold === undefined ? undefined : readNumber(record.zScoreThreshold, `${path}.zScoreThreshold`, { min: 0.5 }),
+    criticalZScoreThreshold: record.criticalZScoreThreshold === undefined ? undefined : readNumber(record.criticalZScoreThreshold, `${path}.criticalZScoreThreshold`, { min: 1 }),
+    minSamples: record.minSamples === undefined ? undefined : readNumber(record.minSamples, `${path}.minSamples`, { integer: true, min: 1 }),
+  }));
+
+  const tarpit = validateOptionalObject(raw.tarpit, 'tarpit', (record, path) => ({
+    enabled: record.enabled === undefined ? undefined : readBoolean(record.enabled, `${path}.enabled`),
+    honeypotPaths: record.honeypotPaths === undefined ? undefined : readStringArray(record.honeypotPaths, `${path}.honeypotPaths`),
+    tarpitEnabled: record.tarpitEnabled === undefined ? undefined : readBoolean(record.tarpitEnabled, `${path}.tarpitEnabled`),
+    tarpitBytesPerSecond: record.tarpitBytesPerSecond === undefined ? undefined : readNumber(record.tarpitBytesPerSecond, `${path}.tarpitBytesPerSecond`, { min: 0.1 }),
+    tarpitMaxDurationMs: record.tarpitMaxDurationMs === undefined ? undefined : readNumber(record.tarpitMaxDurationMs, `${path}.tarpitMaxDurationMs`, { integer: true, min: 1000 }),
+    tarpitResponseSize: record.tarpitResponseSize === undefined ? undefined : readNumber(record.tarpitResponseSize, `${path}.tarpitResponseSize`, { integer: true, min: 1 }),
+    autoBlacklistOnHoneypot: record.autoBlacklistOnHoneypot === undefined ? undefined : readBoolean(record.autoBlacklistOnHoneypot, `${path}.autoBlacklistOnHoneypot`),
+    honeypotResponseCode: record.honeypotResponseCode === undefined ? undefined : readNumber(record.honeypotResponseCode, `${path}.honeypotResponseCode`, { integer: true, min: 100, max: 599 }),
+  }));
+
+  const correlation = validateOptionalObject(raw.correlation, 'correlation', (record, path) => ({
+    enabled: record.enabled === undefined ? undefined : readBoolean(record.enabled, `${path}.enabled`),
+    signatureWindowMs: record.signatureWindowMs === undefined ? undefined : readNumber(record.signatureWindowMs, `${path}.signatureWindowMs`, { integer: true, min: 1000 }),
+    minIPsForCorrelation: record.minIPsForCorrelation === undefined ? undefined : readNumber(record.minIPsForCorrelation, `${path}.minIPsForCorrelation`, { integer: true, min: 2 }),
+    maxTrackedSignatures: record.maxTrackedSignatures === undefined ? undefined : readNumber(record.maxTrackedSignatures, `${path}.maxTrackedSignatures`, { integer: true, min: 100 }),
+    botScoreBoost: record.botScoreBoost === undefined ? undefined : readNumber(record.botScoreBoost, `${path}.botScoreBoost`, { integer: true, min: 1 }),
+    autoBlockThreshold: record.autoBlockThreshold === undefined ? undefined : readNumber(record.autoBlockThreshold, `${path}.autoBlockThreshold`, { integer: true, min: 2 }),
+  }));
+
+  const ja3 = validateOptionalObject(raw.ja3, 'ja3', (record, path) => ({
+    enabled: record.enabled === undefined ? undefined : readBoolean(record.enabled, `${path}.enabled`),
+    blockUnknownFingerprints: record.blockUnknownFingerprints === undefined ? undefined : readBoolean(record.blockUnknownFingerprints, `${path}.blockUnknownFingerprints`),
+    mismatchScoreBoost: record.mismatchScoreBoost === undefined ? undefined : readNumber(record.mismatchScoreBoost, `${path}.mismatchScoreBoost`, { integer: true, min: 1 }),
+    logFingerprints: record.logFingerprints === undefined ? undefined : readBoolean(record.logFingerprints, `${path}.logFingerprints`),
+  }));
+
+  const geoip = validateOptionalObject(raw.geoip, 'geoip', (record, path) => ({
+    enabled: record.enabled === undefined ? undefined : readBoolean(record.enabled, `${path}.enabled`),
+    blockedCountries: record.blockedCountries === undefined ? undefined : readStringArray(record.blockedCountries, `${path}.blockedCountries`),
+    allowedCountries: record.allowedCountries === undefined ? undefined : readStringArray(record.allowedCountries, `${path}.allowedCountries`),
+    challengeCountries: record.challengeCountries === undefined ? undefined : readStringArray(record.challengeCountries, `${path}.challengeCountries`),
+    action: record.action === undefined ? undefined : readString(record.action, `${path}.action`) as 'block' | 'challenge' | 'log',
+  }));
+
+  const wsStream = validateOptionalObject(raw.wsStream, 'wsStream', (record, path) => ({
+    enabled: record.enabled === undefined ? undefined : readBoolean(record.enabled, `${path}.enabled`),
+    metricsIntervalMs: record.metricsIntervalMs === undefined ? undefined : readNumber(record.metricsIntervalMs, `${path}.metricsIntervalMs`, { integer: true, min: 100 }),
+    maxClients: record.maxClients === undefined ? undefined : readNumber(record.maxClients, `${path}.maxClients`, { integer: true, min: 1 }),
+    path: record.path === undefined ? undefined : readString(record.path, `${path}.path`),
+  }));
+
   return {
     target,
     port,
@@ -403,5 +455,11 @@ export function normalizeServerConfig(raw: Partial<ServerConfig>): ServerConfig 
     http2,
     slowloris,
     tlsGuard,
+    anomaly,
+    tarpit,
+    correlation,
+    ja3,
+    geoip,
+    wsStream,
   };
 }
