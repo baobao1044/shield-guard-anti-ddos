@@ -125,14 +125,24 @@ check_status   "XSS: safe HTML passes"               "$BASE/?q=hello+<b>world</b
 echo -e "\n${BOLD}WAF — Path Traversal${NC}"
 check_status   "Path traversal: ../etc/passwd"       "$BASE/../../../etc/passwd"                403
 check_status   "Path traversal: encoded"             "$BASE/%2e%2e%2fetc%2fpasswd"              403
-check_status   "Path traversal: .env"                "$BASE/.env"                               403
-check_status   "Path traversal: .git"                "$BASE/.git"                               403
+check_status   "Path traversal: .env"                "$BASE/.env"                               200
+check_status   "Path traversal: .git"                "$BASE/.git"                               200
 check_status   "Path traversal: safe path"           "$BASE/api/users"                          200
 
 echo -e "\n${BOLD}WAF — Command Injection${NC}"
 check_status   "CMDi: ;cat /etc/passwd"              "$BASE/?cmd=;cat+/etc/passwd"              403
 check_status   "CMDi: | whoami"                      "$BASE/?cmd=|whoami"                       403
 check_status   "CMDi: \$(command)"                   "$BASE/?cmd=\$(id)"                        403
+
+echo -e "\n${BOLD}Honeypot Paths${NC}"
+check_status   "Honeypot: /admin"                    "$BASE/admin"                              200
+check_status   "Honeypot: /wp-login.php"             "$BASE/wp-login.php"                       200
+check_status   "Honeypot: /phpMyAdmin"               "$BASE/phpMyAdmin"                         200
+check_status   "Honeypot: /wp-admin"                 "$BASE/wp-admin"                           200
+check_status   "Honeypot: /administrator"            "$BASE/administrator"                      200
+check_status   "Honeypot: /xmlrpc.php"               "$BASE/xmlrpc.php"                         200
+check_status   "Honeypot: /.aws/credentials"         "$BASE/.aws/credentials"                   200
+check_contains "Honeypot: returns fake login form"   "$BASE/admin"                              "Login"
 
 echo -e "\n${BOLD}Bot Detection${NC}"
 check_status   "Bot: empty user-agent"               "$BASE/"  200  "-H 'User-Agent:'"
@@ -168,6 +178,24 @@ if [[ "$L7" -gt 0 ]]; then
   pass "L7 threats tracked: $L7"
 else
   fail "L7 threats tracked" ">0" "$L7"
+fi
+
+echo -e "\n${BOLD}Layer Stats (incl. new engines)${NC}"
+STATS=$(curl -s "$BASE/shield-api/stats")
+if echo "$STATS" | grep -q '"anomaly"'; then
+  pass "Stats include anomaly engine data"
+else
+  fail "Stats include anomaly" "present" "missing"
+fi
+if echo "$STATS" | grep -q '"correlation"'; then
+  pass "Stats include correlation engine data"
+else
+  fail "Stats include correlation" "present" "missing"
+fi
+if echo "$STATS" | grep -q '"geoip"'; then
+  pass "Stats include GeoIP data"
+else
+  fail "Stats include geoip" "present" "missing"
 fi
 
 # ════════════════════════════════════════════════════════════════════════
@@ -208,11 +236,12 @@ if [[ "$1" == "--benchmark" ]]; then
   ATTACK_START=$(date +%s%N)
   for i in $(seq 1 25); do
     for j in $(seq 1 20); do
-      case $((j % 4)) in
+      case $((j % 5)) in
         0) curl -s -o /dev/null "$BASE/?id=1'+OR+1=1--" ;;
         1) curl -s -o /dev/null "$BASE/?q=<script>alert(1)</script>" ;;
         2) curl -s -o /dev/null "$BASE/../../../etc/passwd" ;;
         3) curl -s -o /dev/null "$BASE/?cmd=;cat+/etc/passwd" ;;
+        4) curl -s -o /dev/null "$BASE/wp-login.php" ;;
       esac &
     done
     wait
@@ -226,6 +255,20 @@ if [[ "$1" == "--benchmark" ]]; then
   FINAL_METRICS=$(curl -s "$BASE/shield-api/metrics")
   AVG_TIME=$(echo "$FINAL_METRICS" | grep -o '"avgProcessingTimeUs":[0-9.]*' | cut -d: -f2)
   echo -e "  ${GREEN}→${NC} Avg processing: ${BOLD}${AVG_TIME}µs${NC}/req"
+
+  echo -e "\n  ${DIM}Honeypot benchmark: 200 scanner probes${NC}"
+  HP_START=$(date +%s%N)
+  for i in $(seq 1 20); do
+    for hp in /admin /wp-admin /wp-login.php /.env /phpMyAdmin /administrator /xmlrpc.php /.git/config /.aws/credentials /backup.sql; do
+      curl -s -o /dev/null "$BASE$hp" &
+    done
+    wait
+  done
+  HP_END=$(date +%s%N)
+  HP_ELAPSED=$(( (HP_END - HP_START) / 1000000 ))
+  HP_RPS=$(( 200 * 1000 / HP_ELAPSED ))
+  echo -e "  ${GREEN}→${NC} 200 honeypot traps in ${HP_ELAPSED}ms"
+  echo -e "  ${GREEN}→${NC} ~${BOLD}${HP_RPS}${NC} traps/s"
 fi
 
 # ════════════════════════════════════════════════════════════════════════

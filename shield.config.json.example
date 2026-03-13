@@ -56,5 +56,66 @@
       "/shield-health",
       "/shield-api/"
     ]
+  },
+  "anomaly": {
+    "enabled": true,
+    "learningPeriodMs": 1800000,
+    "snapshotIntervalMs": 5000,
+    "emaAlpha": 0.1,
+    "zScoreThreshold": 3.0,
+    "criticalZScoreThreshold": 5.0,
+    "minSamples": 20
+  },
+  "tarpit": {
+    "enabled": true,
+    "honeypotPaths": [
+      "/admin",
+      "/wp-admin",
+      "/wp-login.php",
+      "/wp-config.php",
+      "/.env",
+      "/.git/config",
+      "/phpMyAdmin",
+      "/phpmyadmin",
+      "/administrator",
+      "/xmlrpc.php",
+      "/backup.sql",
+      "/database.sql",
+      "/.aws/credentials",
+      "/.ssh/id_rsa"
+    ],
+    "tarpitEnabled": true,
+    "tarpitBytesPerSecond": 1,
+    "tarpitMaxDurationMs": 60000,
+    "tarpitResponseSize": 10240,
+    "autoBlacklistOnHoneypot": true,
+    "honeypotResponseCode": 200
+  },
+  "correlation": {
+    "enabled": true,
+    "signatureWindowMs": 10000,
+    "minIPsForCorrelation": 5,
+    "maxTrackedSignatures": 10000,
+    "botScoreBoost": 30,
+    "autoBlockThreshold": 20
+  },
+  "ja3": {
+    "enabled": true,
+    "blockUnknownFingerprints": false,
+    "mismatchScoreBoost": 40,
+    "logFingerprints": false
+  },
+  "geoip": {
+    "enabled": false,
+    "blockedCountries": [],
+    "allowedCountries": [],
+    "challengeCountries": [],
+    "action": "block"
+  },
+  "wsStream": {
+    "enabled": true,
+    "metricsIntervalMs": 1000,
+    "maxClients": 50,
+    "path": "/shield-ws"
   }
 }
