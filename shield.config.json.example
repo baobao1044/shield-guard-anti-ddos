@@ -11,19 +11,9 @@
     "l7": {
       "enabled": true,
       "rateLimiting": {
-        "global": {
-          "windowMs": 1000,
-          "maxRequests": 50000
-        },
-        "perIP": {
-          "maxRequests": 200,
-          "windowMs": 1000,
-          "burstSize": 500
-        },
-        "perEndpoint": {
-          "windowMs": 1000,
-          "maxRequests": 1000
-        }
+        "global": { "windowMs": 1000, "maxRequests": 50000 },
+        "perIP": { "maxRequests": 200, "windowMs": 1000, "burstSize": 500 },
+        "perEndpoint": { "windowMs": 1000, "maxRequests": 1000 }
       },
       "waf": {
         "enabled": true,
@@ -39,9 +29,7 @@
       },
       "headerValidation": {
         "enabled": true,
-        "requiredHeaders": [
-          "host"
-        ],
+        "requiredHeaders": ["host"],
         "maxHeaders": 100,
         "maxHeaderSize": 16384
       }
@@ -52,10 +40,7 @@
     "difficulty": 4,
     "cookieTTLSeconds": 3600,
     "autoActivateThreshold": 5000,
-    "exemptPaths": [
-      "/shield-health",
-      "/shield-api/"
-    ]
+    "exemptPaths": ["/shield-health", "/shield-api/"]
   },
   "anomaly": {
     "enabled": true,
@@ -68,42 +53,23 @@
   },
   "tarpit": {
     "enabled": true,
-    "honeypotPaths": [
-      "/admin",
-      "/wp-admin",
-      "/wp-login.php",
-      "/wp-config.php",
-      "/.env",
-      "/.git/config",
-      "/phpMyAdmin",
-      "/phpmyadmin",
-      "/administrator",
-      "/xmlrpc.php",
-      "/backup.sql",
-      "/database.sql",
-      "/.aws/credentials",
-      "/.ssh/id_rsa"
-    ],
+    "honeypotPaths": ["/admin", "/wp-admin", "/wp-login.php", "/.env", "/.git/config", "/phpMyAdmin", "/administrator", "/xmlrpc.php", "/.aws/credentials", "/.ssh/id_rsa"],
     "tarpitEnabled": true,
     "tarpitBytesPerSecond": 1,
     "tarpitMaxDurationMs": 60000,
-    "tarpitResponseSize": 10240,
-    "autoBlacklistOnHoneypot": true,
-    "honeypotResponseCode": 200
+    "autoBlacklistOnHoneypot": true
   },
   "correlation": {
     "enabled": true,
     "signatureWindowMs": 10000,
     "minIPsForCorrelation": 5,
-    "maxTrackedSignatures": 10000,
     "botScoreBoost": 30,
     "autoBlockThreshold": 20
   },
   "ja3": {
     "enabled": true,
-    "blockUnknownFingerprints": false,
     "mismatchScoreBoost": 40,
-    "logFingerprints": false
+    "blockUnknownFingerprints": false
   },
   "geoip": {
     "enabled": false,
@@ -117,5 +83,82 @@
     "metricsIntervalMs": 1000,
     "maxClients": 50,
     "path": "/shield-ws"
+  },
+  "mlWaf": {
+    "enabled": true,
+    "threshold": 0.65,
+    "learningMode": false,
+    "ensembleWeight": 0.4
+  },
+  "circuitBreaker": {
+    "enabled": true,
+    "failureThreshold": 5,
+    "failureWindowMs": 10000,
+    "resetTimeoutMs": 30000,
+    "halfOpenMaxRequests": 3,
+    "timeoutMs": 10000,
+    "errorRateThreshold": 0.5
+  },
+  "trafficShaper": {
+    "enabled": true,
+    "classes": {
+      "premium": { "rateLimit": 1000, "burstSize": 2000 },
+      "normal": { "rateLimit": 200, "burstSize": 500 },
+      "suspicious": { "rateLimit": 20, "burstSize": 30 },
+      "bot": { "rateLimit": 5, "burstSize": 10 }
+    },
+    "premiumHeaders": ["x-api-key", "authorization"],
+    "premiumIPs": []
+  },
+  "biometric": {
+    "enabled": true,
+    "injectIntoHTML": true,
+    "scoreTTLMs": 3600000,
+    "minEventsForScore": 5,
+    "humanThreshold": 60
+  },
+  "threatIntel": {
+    "enabled": false,
+    "feeds": [
+      { "name": "Emerging Threats", "url": "https://rules.emergingthreats.net/blockrules/compromised-ips.txt", "format": "plain", "enabled": true },
+      { "name": "Spamhaus DROP", "url": "https://www.spamhaus.org/drop/drop.txt", "format": "plain", "enabled": true },
+      { "name": "Feodo Tracker", "url": "https://feodotracker.abuse.ch/downloads/ipblocklist.txt", "format": "plain", "enabled": true }
+    ],
+    "refreshIntervalMs": 3600000,
+    "maxEntries": 100000
+  },
+  "forensics": {
+    "enabled": true,
+    "maxCaptures": 10000,
+    "captureBody": true,
+    "maxBodyBytes": 4096,
+    "minThreatLevel": 1
+  },
+  "plugins": {
+    "enabled": false,
+    "pluginDir": "./plugins",
+    "hotReload": true,
+    "sandboxed": true,
+    "timeoutMs": 100
+  },
+  "zeroTrust": {
+    "enabled": false,
+    "mtls": {
+      "enabled": false,
+      "requireClientCert": false,
+      "allowedCNs": [],
+      "allowedFingerprints": []
+    },
+    "jwt": {
+      "enabled": false,
+      "headerName": "authorization",
+      "algorithms": ["RS256", "ES256"],
+      "clockToleranceSec": 30
+    },
+    "apiKeys": {
+      "enabled": false,
+      "headerName": "x-api-key",
+      "keys": []
+    }
   }
 }
