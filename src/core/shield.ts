@@ -14,6 +14,10 @@ import { L7Filter } from '../layers/l7-filter';
 import { AnomalyEngine, DEFAULT_ANOMALY_CONFIG } from '../layers/anomaly-engine';
 import { CorrelationEngine, DEFAULT_CORRELATION_CONFIG } from '../layers/correlation-engine';
 import { GeoIPLookup, DEFAULT_GEOIP_CONFIG } from '../layers/geoip';
+import { MLWaf, DEFAULT_ML_WAF_CONFIG } from '../layers/ml-waf';
+import { ThreatIntelFeed, DEFAULT_THREAT_INTEL_CONFIG } from '../layers/threat-intel';
+import { RequestForensics, DEFAULT_FORENSICS_CONFIG } from '../stats/forensics';
+import { PluginLoader, DEFAULT_PLUGIN_CONFIG } from './plugin-loader';
 import { SlidingWindowCounter, CircularBuffer } from '../utils/data-structures';
 import { Logger } from '../utils/logger';
 
@@ -43,6 +47,10 @@ export class AntiDDoSShield {
   readonly anomaly: AnomalyEngine;
   readonly correlation: CorrelationEngine;
   readonly geoip: GeoIPLookup;
+  readonly mlWaf: MLWaf;
+  readonly threatIntel: ThreatIntelFeed;
+  readonly forensics: RequestForensics;
+  readonly plugins: PluginLoader;
 
   // Global metrics
   private totalPackets: number = 0;
@@ -77,6 +85,10 @@ export class AntiDDoSShield {
     anomaly?: Partial<import('../layers/anomaly-engine').AnomalyConfig>;
     correlation?: Partial<import('../layers/correlation-engine').CorrelationConfig>;
     geoip?: Partial<import('../layers/geoip').GeoIPConfig>;
+    mlWaf?: Partial<import('../layers/ml-waf').MLWafConfig>;
+    threatIntel?: Partial<import('../layers/threat-intel').ThreatIntelConfig>;
+    forensics?: Partial<import('../stats/forensics').ForensicsConfig>;
+    plugins?: Partial<import('./plugin-loader').PluginConfig>;
   }) {
     this.config = this.mergeConfig(config);
     this.log = new Logger('Shield', this.config.global.logLevel);
@@ -89,9 +101,18 @@ export class AntiDDoSShield {
     this.anomaly = new AnomalyEngine({ ...DEFAULT_ANOMALY_CONFIG, ...extraConfig?.anomaly });
     this.correlation = new CorrelationEngine({ ...DEFAULT_CORRELATION_CONFIG, ...extraConfig?.correlation });
     this.geoip = new GeoIPLookup({ ...DEFAULT_GEOIP_CONFIG, ...extraConfig?.geoip });
+    this.mlWaf = new MLWaf({ ...DEFAULT_ML_WAF_CONFIG, ...extraConfig?.mlWaf });
+    this.threatIntel = new ThreatIntelFeed({ ...DEFAULT_THREAT_INTEL_CONFIG, ...extraConfig?.threatIntel });
+    this.forensics = new RequestForensics({ ...DEFAULT_FORENSICS_CONFIG, ...extraConfig?.forensics });
+    this.plugins = new PluginLoader({ ...DEFAULT_PLUGIN_CONFIG, ...extraConfig?.plugins });
 
     // Wire auto-block callbacks
     this.correlation.onAutoBlock((ip) => this.l3.addToBlacklist(ip));
+    this.threatIntel.onBlacklist((ip) => this.l3.addToBlacklist(ip));
+
+    // Start background services
+    this.threatIntel.start();
+    this.plugins.init();
 
     this.processingTimes = new CircularBuffer<number>(10000);
     this.recentEvents = new CircularBuffer<BlockEvent>(200);
@@ -108,6 +129,9 @@ export class AntiDDoSShield {
       anomaly: (extraConfig?.anomaly?.enabled !== false),
       correlation: (extraConfig?.correlation?.enabled !== false),
       geoip: (extraConfig?.geoip?.enabled ?? false),
+      mlWaf: (extraConfig?.mlWaf?.enabled !== false),
+      threatIntel: (extraConfig?.threatIntel?.enabled ?? false),
+      plugins: (extraConfig?.plugins?.enabled ?? false),
     });
   }
 
@@ -206,6 +230,20 @@ export class AntiDDoSShield {
       };
     }
 
+    // Threat Intel check (known malicious IPs)
+    const threatIntelResult = this.threatIntel.isKnownThreat(request.ip);
+    if (threatIntelResult.isThreat) {
+      const result: FilterResult = {
+        action: Action.DROP,
+        reason: `Known threat IP (source: ${threatIntelResult.source})`,
+        layer: 'THREAT_INTEL',
+        threatLevel: ThreatLevel.HIGH,
+        processingTimeUs: 0,
+      };
+      this.recordResult(result, request.ip, request.method, request.url);
+      return result;
+    }
+
     // GeoIP check
     const geoResult = this.geoip.lookup(request.ip);
     if (geoResult.action === 'block') {
@@ -265,10 +303,31 @@ export class AntiDDoSShield {
     if (this.config.l7.enabled) {
       const l7Result = this.l7.process(request);
       if (l7Result.action !== Action.ALLOW) {
+        // ML WAF training: label this as malicious (regex caught it)
+        this.mlWaf.recordTraining(request.method, request.url, request.headers, 1);
         this.recordResult(l7Result, request.ip, request.method, request.url);
         this.anomaly.recordRequest(request.ip, request.method, request.url, request.contentLength || 0, true);
         return l7Result;
       }
+    }
+
+    // ML WAF — neural network classification (catches what regex misses)
+    const mlResult = this.mlWaf.classify(request.method, request.url, request.headers);
+    if (mlResult.isMalicious && mlResult.confidence > 0.5) {
+      const result: FilterResult = {
+        action: Action.DROP,
+        reason: `ML WAF: score ${mlResult.score} (${mlResult.topFeatures.join(', ')})`,
+        layer: 'ML_WAF',
+        threatLevel: ThreatLevel.HIGH,
+        processingTimeUs: 0,
+        metadata: { mlScore: mlResult.score, mlFeatures: mlResult.topFeatures },
+      };
+      this.recordResult(result, request.ip, request.method, request.url);
+      this.anomaly.recordRequest(request.ip, request.method, request.url, request.contentLength || 0, true);
+      return result;
+    } else {
+      // ML WAF training: label as benign (passed regex + ML)
+      this.mlWaf.recordTraining(request.method, request.url, request.headers, 0);
     }
 
     // If correlation flagged this IP, escalate to challenge
@@ -295,6 +354,37 @@ export class AntiDDoSShield {
       this.emergencyMode = true;
       this.log.error(`EMERGENCY MODE via anomaly detection — score: ${anomalyResult.score}`);
       setTimeout(() => { this.emergencyMode = false; }, 30000).unref();
+    }
+
+    // Plugin hooks (last chance for custom filters)
+    const pluginResult = this.plugins.executeOnRequest({
+      ip: request.ip,
+      method: request.method,
+      url: request.url,
+      headers: request.headers,
+      userAgent: request.userAgent || '',
+      timestamp: request.timestamp,
+    });
+    if (pluginResult.action === 'BLOCK') {
+      const result: FilterResult = {
+        action: Action.DROP,
+        reason: pluginResult.reason || 'Blocked by plugin',
+        layer: 'PLUGIN',
+        threatLevel: ThreatLevel.MEDIUM,
+        processingTimeUs: 0,
+      };
+      this.recordResult(result, request.ip, request.method, request.url);
+      return result;
+    } else if (pluginResult.action === 'CHALLENGE') {
+      const result: FilterResult = {
+        action: Action.CHALLENGE,
+        reason: pluginResult.reason || 'Challenge by plugin',
+        layer: 'PLUGIN',
+        threatLevel: ThreatLevel.LOW,
+        processingTimeUs: 0,
+      };
+      this.recordResult(result, request.ip, request.method, request.url);
+      return result;
     }
 
     this.totalAllowed++;
@@ -396,6 +486,24 @@ export class AntiDDoSShield {
         threatLevel: result.threatLevel,
         source: typeof result.metadata?.source === 'string' ? result.metadata.source : undefined,
       });
+
+      // Forensic capture
+      if (ip) {
+        this.forensics.capture(ip, method || 'UNKNOWN', path || '/', {}, undefined, {
+          action: result.action,
+          reason: result.reason,
+          layer: result.layer,
+          threatLevel: result.threatLevel,
+        });
+      }
+
+      // Notify plugins
+      this.plugins.executeOnBlock({
+        ip: ip || 'unknown',
+        reason: result.reason,
+        layer: result.layer,
+        timestamp: Date.now(),
+      });
     }
   }
 
@@ -459,6 +567,10 @@ export class AntiDDoSShield {
       anomaly: this.anomaly.getStats(),
       correlation: this.correlation.getStats(),
       geoip: this.geoip.getStats(),
+      mlWaf: this.mlWaf.getStats(),
+      threatIntel: this.threatIntel.getStats(),
+      forensics: this.forensics.getStats(),
+      plugins: this.plugins.getStats(),
     };
   }
 

@@ -240,4 +240,12 @@ export interface ServerConfig {
   ja3?: Partial<import('../layers/ja3-fingerprint').JA3Config>;
   geoip?: Partial<import('../layers/geoip').GeoIPConfig>;
   wsStream?: Partial<import('../stats/ws-stream').WSStreamConfig>;
+  mlWaf?: Partial<import('../layers/ml-waf').MLWafConfig>;
+  circuitBreaker?: Partial<import('../proxy/circuit-breaker').CircuitBreakerConfig>;
+  trafficShaper?: Partial<import('../proxy/circuit-breaker').TrafficShaperConfig>;
+  biometric?: Partial<import('../layers/biometric-sdk').BiometricConfig>;
+  threatIntel?: Partial<import('../layers/threat-intel').ThreatIntelConfig>;
+  forensics?: Partial<import('../stats/forensics').ForensicsConfig>;
+  plugins?: Partial<import('../core/plugin-loader').PluginConfig>;
+  zeroTrust?: Partial<import('../proxy/mtls-gateway').ZeroTrustConfig>;
 }

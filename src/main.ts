@@ -193,6 +193,10 @@ function main(): void {
     anomaly: config.anomaly,
     correlation: config.correlation,
     geoip: config.geoip,
+    mlWaf: config.mlWaf,
+    threatIntel: config.threatIntel,
+    forensics: config.forensics,
+    plugins: config.plugins,
   });
   const { uam } = createProxyServer(config, shield);
 
