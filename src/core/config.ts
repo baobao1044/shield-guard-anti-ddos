@@ -70,7 +70,7 @@ export const DEFAULT_CONFIG: ShieldConfig = {
       perEndpoint: { windowMs: 1000, maxRequests: 1000 },
     },
     httpFloodProtection: {
-      requestSizeLimit: 10 * 1024 * 1024, // 10MB
+      requestSizeLimit: 10 * 1024 * 1024,
     },
     waf: {
       enabled: true,
@@ -132,11 +132,7 @@ function readBoolean(value: unknown, path: string): boolean {
   return value;
 }
 
-function readNumber(value: unknown, path: string, opts?: {
-  integer?: boolean;
-  min?: number;
-  max?: number;
-}): number {
+function readNumber(value: unknown, path: string, opts?: { integer?: boolean; min?: number; max?: number }): number {
   if (typeof value !== 'number' || Number.isNaN(value) || !Number.isFinite(value)) {
     throw new ConfigValidationError(`${path} must be a valid number`);
   }
@@ -152,11 +148,7 @@ function readNumber(value: unknown, path: string, opts?: {
   return value;
 }
 
-function readOptionalNumber(value: unknown, path: string, opts?: {
-  integer?: boolean;
-  min?: number;
-  max?: number;
-}): number | undefined {
+function readOptionalNumber(value: unknown, path: string, opts?: { integer?: boolean; min?: number; max?: number }): number | undefined {
   if (value === undefined) return undefined;
   return readNumber(value, path, opts);
 }
@@ -191,9 +183,8 @@ function validateTls(raw: unknown): TLSConfig | undefined {
   if ((cert && !key) || (!cert && key)) {
     throw new ConfigValidationError('tls.cert and tls.key must be provided together');
   }
-
   if (!cert && !selfSigned) {
-    throw new ConfigValidationError('tls requires cert/key or selfSigned=true');
+    throw new ConfigValidationError('tls requires cert/key or tls.selfSigned=true');
   }
 
   return { cert, key, selfSigned };
@@ -208,15 +199,9 @@ function validateShield(raw: unknown): Partial<ShieldConfig> | undefined {
     const global = asRecord(shield.global, 'shield.global');
     result.global = {
       logLevel: global.logLevel === undefined ? DEFAULT_CONFIG.global.logLevel : readString(global.logLevel, 'shield.global.logLevel'),
-      emergencyThreshold: global.emergencyThreshold === undefined
-        ? DEFAULT_CONFIG.global.emergencyThreshold
-        : readNumber(global.emergencyThreshold, 'shield.global.emergencyThreshold', { integer: true, min: 1 }),
-      adaptiveMode: global.adaptiveMode === undefined
-        ? DEFAULT_CONFIG.global.adaptiveMode
-        : readBoolean(global.adaptiveMode, 'shield.global.adaptiveMode'),
-      whitelistIPs: global.whitelistIPs === undefined
-        ? [...DEFAULT_CONFIG.global.whitelistIPs]
-        : readStringArray(global.whitelistIPs, 'shield.global.whitelistIPs'),
+      emergencyThreshold: global.emergencyThreshold === undefined ? DEFAULT_CONFIG.global.emergencyThreshold : readNumber(global.emergencyThreshold, 'shield.global.emergencyThreshold', { integer: true, min: 1 }),
+      adaptiveMode: global.adaptiveMode === undefined ? DEFAULT_CONFIG.global.adaptiveMode : readBoolean(global.adaptiveMode, 'shield.global.adaptiveMode'),
+      whitelistIPs: global.whitelistIPs === undefined ? [...DEFAULT_CONFIG.global.whitelistIPs] : readStringArray(global.whitelistIPs, 'shield.global.whitelistIPs'),
     };
   }
 
@@ -332,11 +317,7 @@ function validateShield(raw: unknown): Partial<ShieldConfig> | undefined {
   return result;
 }
 
-function validateOptionalObject<T extends object>(
-  raw: unknown,
-  path: string,
-  validator: (record: JsonRecord, path: string) => T,
-): T | undefined {
+function validateOptionalObject<T extends object>(raw: unknown, path: string, validator: (record: JsonRecord, path: string) => T): T | undefined {
   if (raw === undefined) return undefined;
   return validator(asRecord(raw, path), path);
 }
@@ -345,14 +326,23 @@ function validatePositivePort(value: unknown, path: string): number {
   return readNumber(value, path, { integer: true, min: 1, max: 65535 });
 }
 
+function ensureUnsupportedSectionDisabled(raw: unknown, path: string): void {
+  if (raw === undefined) return;
+  const section = asRecord(raw, path);
+  if (section.enabled === false) {
+    return;
+  }
+  throw new ConfigValidationError(`${path} is not wired into the current runtime and cannot be enabled`);
+}
+
 export function normalizeServerConfig(raw: Partial<ServerConfig>): ServerConfig {
   const target = validateUrl(readString(raw.target, 'target'), 'target');
   const port = validatePositivePort(raw.port, 'port');
   const httpsPort = raw.httpsPort === undefined ? undefined : validatePositivePort(raw.httpsPort, 'httpsPort');
+  const trustedProxies = raw.trustedProxies === undefined ? undefined : readStringArray(raw.trustedProxies, 'trustedProxies');
+  const trustForwardedHeaders = raw.trustForwardedHeaders === undefined ? undefined : readBoolean(raw.trustForwardedHeaders, 'trustForwardedHeaders');
   const tls = validateTls(raw.tls);
-  const dashboardPassword = raw.dashboardPassword === undefined
-    ? undefined
-    : readOptionalString(raw.dashboardPassword, 'dashboardPassword');
+  const dashboardPassword = raw.dashboardPassword === undefined ? undefined : readOptionalString(raw.dashboardPassword, 'dashboardPassword');
 
   if (httpsPort !== undefined && !tls) {
     throw new ConfigValidationError('httpsPort requires tls.cert/key or tls.selfSigned=true');
@@ -444,10 +434,121 @@ export function normalizeServerConfig(raw: Partial<ServerConfig>): ServerConfig 
     path: record.path === undefined ? undefined : readString(record.path, `${path}.path`),
   }));
 
+  const mlWaf = validateOptionalObject(raw.mlWaf, 'mlWaf', (record, path) => ({
+    enabled: record.enabled === undefined ? undefined : readBoolean(record.enabled, `${path}.enabled`),
+    threshold: record.threshold === undefined ? undefined : readNumber(record.threshold, `${path}.threshold`, { min: 0, max: 1 }),
+    learningMode: record.learningMode === undefined ? undefined : readBoolean(record.learningMode, `${path}.learningMode`),
+    ensembleWeight: record.ensembleWeight === undefined ? undefined : readNumber(record.ensembleWeight, `${path}.ensembleWeight`, { min: 0, max: 1 }),
+  }));
+
+  const threatIntel = validateOptionalObject(raw.threatIntel, 'threatIntel', (record, path) => ({
+    enabled: record.enabled === undefined ? undefined : readBoolean(record.enabled, `${path}.enabled`),
+    refreshIntervalMs: record.refreshIntervalMs === undefined ? undefined : readNumber(record.refreshIntervalMs, `${path}.refreshIntervalMs`, { integer: true, min: 1000 }),
+    maxEntries: record.maxEntries === undefined ? undefined : readNumber(record.maxEntries, `${path}.maxEntries`, { integer: true, min: 1 }),
+    feeds: record.feeds === undefined ? undefined : (Array.isArray(record.feeds) ? record.feeds.map((value, index) => {
+      const feed = asRecord(value, `${path}.feeds[${index}]`);
+      return {
+        name: readString(feed.name, `${path}.feeds[${index}].name`),
+        url: validateUrl(readString(feed.url, `${path}.feeds[${index}].url`), `${path}.feeds[${index}].url`),
+        format: readString(feed.format, `${path}.feeds[${index}].format`) as 'plain' | 'json' | 'csv',
+        jsonPath: feed.jsonPath === undefined ? undefined : readString(feed.jsonPath, `${path}.feeds[${index}].jsonPath`),
+        enabled: feed.enabled === undefined ? true : readBoolean(feed.enabled, `${path}.feeds[${index}].enabled`),
+      };
+    }) : (() => { throw new ConfigValidationError(`${path}.feeds must be an array`); })()),
+  }));
+
+  const forensics = validateOptionalObject(raw.forensics, 'forensics', (record, path) => ({
+    enabled: record.enabled === undefined ? undefined : readBoolean(record.enabled, `${path}.enabled`),
+    maxCaptures: record.maxCaptures === undefined ? undefined : readNumber(record.maxCaptures, `${path}.maxCaptures`, { integer: true, min: 1 }),
+    captureBody: record.captureBody === undefined ? undefined : readBoolean(record.captureBody, `${path}.captureBody`),
+    maxBodyBytes: record.maxBodyBytes === undefined ? undefined : readNumber(record.maxBodyBytes, `${path}.maxBodyBytes`, { integer: true, min: 1 }),
+    minThreatLevel: record.minThreatLevel === undefined ? undefined : readNumber(record.minThreatLevel, `${path}.minThreatLevel`, { integer: true, min: 0, max: 4 }),
+  }));
+
+  const plugins = validateOptionalObject(raw.plugins, 'plugins', (record, path) => ({
+    enabled: record.enabled === undefined ? undefined : readBoolean(record.enabled, `${path}.enabled`),
+    pluginDir: record.pluginDir === undefined ? undefined : readString(record.pluginDir, `${path}.pluginDir`),
+    hotReload: record.hotReload === undefined ? undefined : readBoolean(record.hotReload, `${path}.hotReload`),
+    sandboxed: record.sandboxed === undefined ? undefined : readBoolean(record.sandboxed, `${path}.sandboxed`),
+    timeoutMs: record.timeoutMs === undefined ? undefined : readNumber(record.timeoutMs, `${path}.timeoutMs`, { integer: true, min: 1 }),
+  }));
+
+  const zeroTrust = validateOptionalObject(raw.zeroTrust, 'zeroTrust', (record, path) => {
+    const mtls = record.mtls === undefined ? undefined : (() => {
+      const mtlsRecord = asRecord(record.mtls, `${path}.mtls`);
+      return {
+        enabled: mtlsRecord.enabled === undefined ? undefined : readBoolean(mtlsRecord.enabled, `${path}.mtls.enabled`),
+        requireClientCert: mtlsRecord.requireClientCert === undefined ? undefined : readBoolean(mtlsRecord.requireClientCert, `${path}.mtls.requireClientCert`),
+        allowedCNs: mtlsRecord.allowedCNs === undefined ? undefined : readStringArray(mtlsRecord.allowedCNs, `${path}.mtls.allowedCNs`),
+        allowedFingerprints: mtlsRecord.allowedFingerprints === undefined ? undefined : readStringArray(mtlsRecord.allowedFingerprints, `${path}.mtls.allowedFingerprints`),
+      };
+    })();
+
+    const jwt = record.jwt === undefined ? undefined : (() => {
+      const jwtRecord = asRecord(record.jwt, `${path}.jwt`);
+      return {
+        enabled: jwtRecord.enabled === undefined ? undefined : readBoolean(jwtRecord.enabled, `${path}.jwt.enabled`),
+        headerName: jwtRecord.headerName === undefined ? undefined : readString(jwtRecord.headerName, `${path}.jwt.headerName`),
+        algorithms: jwtRecord.algorithms === undefined ? undefined : readStringArray(jwtRecord.algorithms, `${path}.jwt.algorithms`),
+        issuer: jwtRecord.issuer === undefined ? undefined : readString(jwtRecord.issuer, `${path}.jwt.issuer`),
+        audience: jwtRecord.audience === undefined ? undefined : readString(jwtRecord.audience, `${path}.jwt.audience`),
+        clockToleranceSec: jwtRecord.clockToleranceSec === undefined ? undefined : readNumber(jwtRecord.clockToleranceSec, `${path}.jwt.clockToleranceSec`, { integer: true, min: 0 }),
+        sharedSecrets: jwtRecord.sharedSecrets === undefined ? undefined : readStringArray(jwtRecord.sharedSecrets, `${path}.jwt.sharedSecrets`),
+        publicKeys: jwtRecord.publicKeys === undefined ? undefined : readStringArray(jwtRecord.publicKeys, `${path}.jwt.publicKeys`),
+      };
+    })();
+
+    const apiKeys = record.apiKeys === undefined ? undefined : (() => {
+      const apiRecord = asRecord(record.apiKeys, `${path}.apiKeys`);
+      return {
+        enabled: apiRecord.enabled === undefined ? undefined : readBoolean(apiRecord.enabled, `${path}.apiKeys.enabled`),
+        headerName: apiRecord.headerName === undefined ? undefined : readString(apiRecord.headerName, `${path}.apiKeys.headerName`),
+        keys: apiRecord.keys === undefined ? undefined : (Array.isArray(apiRecord.keys) ? apiRecord.keys.map((value, index) => {
+          const entry = asRecord(value, `${path}.apiKeys.keys[${index}]`);
+          return {
+            key: readString(entry.key, `${path}.apiKeys.keys[${index}].key`),
+            name: readString(entry.name, `${path}.apiKeys.keys[${index}].name`),
+            rateLimit: readNumber(entry.rateLimit, `${path}.apiKeys.keys[${index}].rateLimit`, { integer: true, min: 1 }),
+            permissions: entry.permissions === undefined ? [] : readStringArray(entry.permissions, `${path}.apiKeys.keys[${index}].permissions`),
+            active: entry.active === undefined ? true : readBoolean(entry.active, `${path}.apiKeys.keys[${index}].active`),
+          };
+        }) : (() => { throw new ConfigValidationError(`${path}.apiKeys.keys must be an array`); })()),
+      };
+    })();
+
+    const normalized = {
+      enabled: record.enabled === undefined ? undefined : readBoolean(record.enabled, `${path}.enabled`),
+      mtls,
+      jwt,
+      apiKeys,
+    };
+
+    const mtlsEnabled = normalized.mtls?.enabled ?? false;
+    const jwtEnabled = normalized.jwt?.enabled ?? false;
+    const apiKeyEnabled = normalized.apiKeys?.enabled ?? false;
+    const zeroTrustEnabled = normalized.enabled ?? (mtlsEnabled || jwtEnabled || apiKeyEnabled);
+
+    if (zeroTrustEnabled && !mtlsEnabled && !jwtEnabled && !apiKeyEnabled) {
+      throw new ConfigValidationError('zeroTrust.enabled requires at least one active sub-control');
+    }
+
+    if (jwtEnabled && (normalized.jwt?.sharedSecrets?.length ?? 0) === 0 && (normalized.jwt?.publicKeys?.length ?? 0) === 0) {
+      throw new ConfigValidationError('zeroTrust.jwt.enabled requires sharedSecrets or publicKeys');
+    }
+
+    return normalized;
+  });
+
+  ensureUnsupportedSectionDisabled(raw.circuitBreaker, 'circuitBreaker');
+  ensureUnsupportedSectionDisabled(raw.trafficShaper, 'trafficShaper');
+  ensureUnsupportedSectionDisabled(raw.biometric, 'biometric');
+
   return {
     target,
     port,
     httpsPort,
+    trustedProxies,
+    trustForwardedHeaders,
     tls,
     dashboardPassword,
     shield: validateShield(raw.shield),
@@ -461,5 +562,10 @@ export function normalizeServerConfig(raw: Partial<ServerConfig>): ServerConfig 
     ja3,
     geoip,
     wsStream,
+    mlWaf,
+    threatIntel,
+    forensics,
+    plugins,
+    zeroTrust,
   };
 }
