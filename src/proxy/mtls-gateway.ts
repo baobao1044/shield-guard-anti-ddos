@@ -8,26 +8,38 @@ import { LRUCache } from '../utils/data-structures';
 import { Logger } from '../utils/logger';
 
 const log = new Logger('ZeroTrust');
+const SUPPORTED_JWT_ALGORITHMS = new Set([
+  'HS256', 'HS384', 'HS512',
+  'RS256', 'RS384', 'RS512',
+  'ES256', 'ES384', 'ES512',
+]);
+
+type SupportedJWTAlgorithm =
+  | 'HS256' | 'HS384' | 'HS512'
+  | 'RS256' | 'RS384' | 'RS512'
+  | 'ES256' | 'ES384' | 'ES512';
 
 export interface ZeroTrustConfig {
   enabled: boolean;
   mtls: {
     enabled: boolean;
     requireClientCert: boolean;
-    allowedCNs: string[];          // Allowed Common Names  
-    allowedFingerprints: string[]; // Allowed cert SHA256 fingerprints
+    allowedCNs: string[];
+    allowedFingerprints: string[];
   };
   jwt: {
     enabled: boolean;
-    headerName: string;            // Header to read JWT from (default: 'authorization')
-    algorithms: string[];          // Allowed algorithms (default: ['RS256','ES256'])
-    issuer?: string;               // Required issuer claim
-    audience?: string;             // Required audience claim
-    clockToleranceSec: number;     // Clock skew tolerance
+    headerName: string;
+    algorithms: string[];
+    issuer?: string;
+    audience?: string;
+    clockToleranceSec: number;
+    sharedSecrets: string[];
+    publicKeys: string[];
   };
   apiKeys: {
     enabled: boolean;
-    headerName: string;            // Header containing API key (default: 'x-api-key')
+    headerName: string;
     keys: ApiKeyEntry[];
   };
 }
@@ -35,8 +47,8 @@ export interface ZeroTrustConfig {
 export interface ApiKeyEntry {
   key: string;
   name: string;
-  rateLimit: number;             // Requests per minute
-  permissions: string[];         // Allowed path prefixes
+  rateLimit: number;
+  permissions: string[];
   active: boolean;
 }
 
@@ -53,6 +65,8 @@ export const DEFAULT_ZERO_TRUST_CONFIG: ZeroTrustConfig = {
     headerName: 'authorization',
     algorithms: ['RS256', 'ES256'],
     clockToleranceSec: 30,
+    sharedSecrets: [],
+    publicKeys: [],
   },
   apiKeys: {
     enabled: false,
@@ -60,6 +74,12 @@ export const DEFAULT_ZERO_TRUST_CONFIG: ZeroTrustConfig = {
     keys: [],
   },
 };
+
+interface JWTHeader {
+  alg?: string;
+  kid?: string;
+  typ?: string;
+}
 
 interface JWTPayload {
   sub?: string;
@@ -79,10 +99,90 @@ export interface AuthResult {
   permissions?: string[];
 }
 
+function base64UrlDecode(value: string): Buffer {
+  const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+  const padding = normalized.length % 4 === 0 ? '' : '='.repeat(4 - (normalized.length % 4));
+  return Buffer.from(normalized + padding, 'base64');
+}
+
+function decodeJSON<T>(value: string, label: string): T {
+  try {
+    return JSON.parse(base64UrlDecode(value).toString('utf8')) as T;
+  } catch {
+    throw new Error(`Invalid JWT ${label}`);
+  }
+}
+
+function getHashAlgorithm(alg: SupportedJWTAlgorithm): string {
+  switch (alg) {
+    case 'HS256':
+    case 'RS256':
+    case 'ES256':
+      return 'sha256';
+    case 'HS384':
+    case 'RS384':
+    case 'ES384':
+      return 'sha384';
+    case 'HS512':
+    case 'RS512':
+    case 'ES512':
+      return 'sha512';
+  }
+}
+
+function isHmacAlgorithm(alg: SupportedJWTAlgorithm): boolean {
+  return alg.startsWith('HS');
+}
+
+function isEcdsaAlgorithm(alg: SupportedJWTAlgorithm): boolean {
+  return alg.startsWith('ES');
+}
+
+function getEcdsaComponentLength(alg: SupportedJWTAlgorithm): number {
+  switch (alg) {
+    case 'ES256': return 32;
+    case 'ES384': return 48;
+    case 'ES512': return 66;
+    default: throw new Error(`Unsupported ECDSA algorithm: ${alg}`);
+  }
+}
+
+function trimLeadingZeros(buffer: Buffer): Buffer {
+  let index = 0;
+  while (index < buffer.length - 1 && buffer[index] === 0) {
+    index++;
+  }
+  return buffer.subarray(index);
+}
+
+function encodeDerInteger(buffer: Buffer): Buffer {
+  const trimmed = trimLeadingZeros(buffer);
+  if (trimmed[0] & 0x80) {
+    return Buffer.concat([Buffer.from([0x02, trimmed.length + 1, 0x00]), trimmed]);
+  }
+  return Buffer.concat([Buffer.from([0x02, trimmed.length]), trimmed]);
+}
+
+function joseToDer(signature: Buffer, alg: SupportedJWTAlgorithm): Buffer {
+  if (!isEcdsaAlgorithm(alg)) {
+    return signature;
+  }
+
+  const componentLength = getEcdsaComponentLength(alg);
+  if (signature.length !== componentLength * 2) {
+    throw new Error('Invalid ECDSA JWT signature length');
+  }
+
+  const r = encodeDerInteger(signature.subarray(0, componentLength));
+  const s = encodeDerInteger(signature.subarray(componentLength));
+  const sequenceLength = r.length + s.length;
+  return Buffer.concat([Buffer.from([0x30, sequenceLength]), r, s]);
+}
+
 export class ZeroTrustGateway {
   private readonly config: ZeroTrustConfig;
   private apiKeyMap: Map<string, ApiKeyEntry> = new Map();
-  private apiKeyRates: LRUCache<number>; // key -> request count in current minute
+  private apiKeyRates: LRUCache<number>;
 
   private stats = {
     mtlsChecks: 0,
@@ -99,12 +199,10 @@ export class ZeroTrustGateway {
 
   constructor(config: ZeroTrustConfig) {
     this.config = config;
-    this.apiKeyRates = new LRUCache(10000, 60000); // 1 min TTL
+    this.apiKeyRates = new LRUCache(10000, 60000);
 
-    // Index API keys for O(1) lookup
     for (const entry of config.apiKeys.keys) {
       if (entry.active) {
-        // Hash the key for secure comparison
         const hash = crypto.createHash('sha256').update(entry.key).digest('hex');
         this.apiKeyMap.set(hash, entry);
       }
@@ -120,9 +218,6 @@ export class ZeroTrustGateway {
     }
   }
 
-  /**
-   * Verify mTLS client certificate
-   */
   verifyClientCert(cert: { subject?: { CN?: string }; fingerprint256?: string; valid?: boolean }): AuthResult {
     if (!this.config.mtls.enabled) return { allowed: true };
 
@@ -136,7 +231,6 @@ export class ZeroTrustGateway {
       return { allowed: true };
     }
 
-    // Check allowed CNs
     if (this.config.mtls.allowedCNs.length > 0) {
       const cn = cert.subject?.CN;
       if (!cn || !this.config.mtls.allowedCNs.includes(cn)) {
@@ -145,10 +239,9 @@ export class ZeroTrustGateway {
       }
     }
 
-    // Check allowed fingerprints
     if (this.config.mtls.allowedFingerprints.length > 0) {
-      const fp = cert.fingerprint256;
-      if (!fp || !this.config.mtls.allowedFingerprints.includes(fp)) {
+      const fingerprint = cert.fingerprint256;
+      if (!fingerprint || !this.config.mtls.allowedFingerprints.includes(fingerprint)) {
         this.stats.mtlsDenied++;
         return { allowed: false, reason: 'Certificate fingerprint not allowed' };
       }
@@ -158,17 +251,33 @@ export class ZeroTrustGateway {
     return { allowed: true, identity: cert.subject?.CN || 'cert-auth' };
   }
 
-  /**
-   * Validate JWT token from request headers
-   * NOTE: This performs structural validation only (no signature verification
-   * without the public key — in production, integrate with JWKS endpoint)
-   */
+  private verifyJWTSignature(signingInput: string, signaturePart: string, alg: SupportedJWTAlgorithm): boolean {
+    const hashAlgorithm = getHashAlgorithm(alg);
+    const signature = joseToDer(base64UrlDecode(signaturePart), alg);
+
+    if (isHmacAlgorithm(alg)) {
+      for (const secret of this.config.jwt.sharedSecrets) {
+        const expected = crypto.createHmac(hashAlgorithm, secret).update(signingInput).digest();
+        if (expected.length === signature.length && crypto.timingSafeEqual(expected, signature)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    return this.config.jwt.publicKeys.some((key) => {
+      try {
+        return crypto.verify(hashAlgorithm, Buffer.from(signingInput), key, signature);
+      } catch {
+        return false;
+      }
+    });
+  }
+
   validateJWT(authHeader: string): AuthResult {
     if (!this.config.jwt.enabled) return { allowed: true };
 
     this.stats.jwtChecks++;
-
-    // Extract token from "Bearer <token>"
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
     const parts = token.split('.');
     if (parts.length !== 3) {
@@ -177,36 +286,42 @@ export class ZeroTrustGateway {
     }
 
     try {
-      // Decode payload (Base64URL)
-      const payload = JSON.parse(
-        Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')
-      ) as JWTPayload;
+      const header = decodeJSON<JWTHeader>(parts[0], 'header');
+      const payload = decodeJSON<JWTPayload>(parts[1], 'payload');
+      const alg = header.alg as SupportedJWTAlgorithm | undefined;
+
+      if (!alg || !SUPPORTED_JWT_ALGORITHMS.has(alg) || !this.config.jwt.algorithms.includes(alg)) {
+        this.stats.jwtInvalid++;
+        return { allowed: false, reason: `JWT algorithm not allowed: ${alg || 'missing'}` };
+      }
+
+      const signingInput = `${parts[0]}.${parts[1]}`;
+      if (!this.verifyJWTSignature(signingInput, parts[2], alg)) {
+        this.stats.jwtInvalid++;
+        return { allowed: false, reason: 'JWT signature verification failed' };
+      }
 
       const now = Math.floor(Date.now() / 1000);
       const tolerance = this.config.jwt.clockToleranceSec;
 
-      // Check expiration
       if (payload.exp && payload.exp + tolerance < now) {
         this.stats.jwtInvalid++;
         return { allowed: false, reason: 'JWT expired' };
       }
 
-      // Check not-before
       if (payload.nbf && payload.nbf - tolerance > now) {
         this.stats.jwtInvalid++;
         return { allowed: false, reason: 'JWT not yet valid' };
       }
 
-      // Check issuer
       if (this.config.jwt.issuer && payload.iss !== this.config.jwt.issuer) {
         this.stats.jwtInvalid++;
         return { allowed: false, reason: `Invalid JWT issuer: ${payload.iss}` };
       }
 
-      // Check audience
       if (this.config.jwt.audience) {
-        const aud = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
-        if (!aud.includes(this.config.jwt.audience)) {
+        const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+        if (!audiences.includes(this.config.jwt.audience)) {
           this.stats.jwtInvalid++;
           return { allowed: false, reason: 'Invalid JWT audience' };
         }
@@ -214,20 +329,16 @@ export class ZeroTrustGateway {
 
       this.stats.jwtValid++;
       return { allowed: true, identity: payload.sub || 'jwt-auth' };
-    } catch {
+    } catch (error) {
       this.stats.jwtInvalid++;
-      return { allowed: false, reason: 'JWT decode error' };
+      return { allowed: false, reason: error instanceof Error ? error.message : 'JWT decode error' };
     }
   }
 
-  /**
-   * Validate API key and check rate limits
-   */
   validateApiKey(key: string, requestPath: string): AuthResult {
     if (!this.config.apiKeys.enabled) return { allowed: true };
 
     this.stats.apiKeyChecks++;
-
     const hash = crypto.createHash('sha256').update(key).digest('hex');
     const entry = this.apiKeyMap.get(hash);
 
@@ -236,23 +347,21 @@ export class ZeroTrustGateway {
       return { allowed: false, reason: 'Invalid API key' };
     }
 
-    // Check permissions (path prefix matching)
     if (entry.permissions.length > 0) {
-      const allowed = entry.permissions.some(p => requestPath.startsWith(p));
+      const allowed = entry.permissions.some((permission) => requestPath.startsWith(permission));
       if (!allowed) {
         this.stats.apiKeyInvalid++;
         return { allowed: false, reason: `API key not authorized for path: ${requestPath}` };
       }
     }
 
-    // Check rate limit
     const currentCount = this.apiKeyRates.get(hash) || 0;
     if (currentCount >= entry.rateLimit) {
       this.stats.apiKeyRateLimited++;
       return { allowed: false, reason: 'API key rate limit exceeded', rateLimit: entry.rateLimit };
     }
-    this.apiKeyRates.set(hash, currentCount + 1);
 
+    this.apiKeyRates.set(hash, currentCount + 1);
     this.stats.apiKeyValid++;
     return {
       allowed: true,
@@ -262,9 +371,6 @@ export class ZeroTrustGateway {
     };
   }
 
-  /**
-   * Combined auth check: mTLS → JWT → API Key (first match wins)
-   */
   authenticate(
     headers: Record<string, string>,
     requestPath: string,
@@ -272,26 +378,22 @@ export class ZeroTrustGateway {
   ): AuthResult {
     if (!this.config.enabled) return { allowed: true };
 
-    // mTLS check
-    if (this.config.mtls.enabled && clientCert) {
-      const result = this.verifyClientCert(clientCert);
+    if (this.config.mtls.enabled) {
+      const result = this.verifyClientCert(clientCert ?? { valid: false });
       if (!result.allowed) return result;
-      if (result.identity) return result; // Authenticated via cert
+      if (result.identity) return result;
     }
 
-    // JWT check
     const authHeader = headers[this.config.jwt.headerName];
     if (this.config.jwt.enabled && authHeader) {
       return this.validateJWT(authHeader);
     }
 
-    // API key check
     const apiKey = headers[this.config.apiKeys.headerName];
     if (this.config.apiKeys.enabled && apiKey) {
       return this.validateApiKey(apiKey, requestPath);
     }
 
-    // No auth mechanism matched
     if (this.config.mtls.requireClientCert || this.config.jwt.enabled || this.config.apiKeys.enabled) {
       return { allowed: false, reason: 'Authentication required' };
     }
@@ -299,5 +401,7 @@ export class ZeroTrustGateway {
     return { allowed: true };
   }
 
-  getStats() { return { ...this.stats }; }
+  getStats() {
+    return { ...this.stats };
+  }
 }
