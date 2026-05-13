@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "http-proxy": "^1.18.1",
+    "jose": "^6.2.3",
     "selfsigned": "^2.4.1"
   },
   "devDependencies": {
