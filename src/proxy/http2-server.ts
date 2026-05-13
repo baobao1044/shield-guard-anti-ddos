@@ -13,6 +13,7 @@ import { UnderAttackMode } from '../layers/uam';
 import { TLSGuard, DEFAULT_TLS_GUARD_CONFIG } from '../layers/tls-guard';
 import { renderDashboard, handleDashboardAPI } from '../dashboard/dashboard';
 import httpProxy from 'http-proxy';
+import { DEFAULT_ZERO_TRUST_CONFIG, ZeroTrustGateway } from './mtls-gateway';
 
 const log = new Logger('HTTP2');
 
@@ -29,10 +30,10 @@ interface SessionState {
 
 export interface Http2Config {
   enabled: boolean;
-  port: number;         // usually 443 when HTTPS
-  maxResetPerSec: number;      // RST_STREAM rate limit per session
-  maxStreamsPerSec: number;    // Max new streams per second
-  maxConcurrentStreams: number; // HTTP/2 server setting
+  port: number;
+  maxResetPerSec: number;
+  maxStreamsPerSec: number;
+  maxConcurrentStreams: number;
 }
 
 export const DEFAULT_HTTP2_CONFIG: Http2Config = {
@@ -43,11 +44,13 @@ export const DEFAULT_HTTP2_CONFIG: Http2Config = {
   maxConcurrentStreams: 100,
 };
 
-function getTLSOptions(config: ServerConfig): { cert: Buffer | string; key: Buffer | string } {
+function getTLSOptions(config: ServerConfig): { cert: Buffer | string; key: Buffer | string; requestCert: boolean; rejectUnauthorized: boolean } {
   if (config.tls?.cert && config.tls?.key) {
     return {
       cert: fs.readFileSync(config.tls.cert),
       key: fs.readFileSync(config.tls.key),
+      requestCert: !!config.zeroTrust?.enabled && !!config.zeroTrust.mtls.enabled,
+      rejectUnauthorized: false,
     };
   }
   // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -55,16 +58,12 @@ function getTLSOptions(config: ServerConfig): { cert: Buffer | string; key: Buff
   const pems = selfsigned.generate([{ name: 'commonName', value: 'shield-guard' }], {
     days: 365, keySize: 2048,
   });
-  return { cert: pems.cert, key: pems.private };
-}
-
-function parseCookies(h: string = ''): Record<string, string> {
-  const r: Record<string, string> = {};
-  for (const p of h.split(';')) {
-    const [k, ...v] = p.trim().split('=');
-    if (k) r[k.trim()] = v.join('=').trim();
-  }
-  return r;
+  return {
+    cert: pems.cert,
+    key: pems.private,
+    requestCert: !!config.zeroTrust?.enabled && !!config.zeroTrust.mtls.enabled,
+    rejectUnauthorized: false,
+  };
 }
 
 function checkDashboardAuth(headers: http2.IncomingHttpHeaders, password?: string): boolean {
@@ -77,6 +76,30 @@ function checkDashboardAuth(headers: http2.IncomingHttpHeaders, password?: strin
   try { return crypto.timingSafeEqual(expected, provided); } catch { return false; }
 }
 
+function getPeerCertificate(session: http2.ServerHttp2Session) {
+  const tlsSocket = session.socket as http2.ServerHttp2Session['socket'] & {
+    getPeerCertificate?: () => { subject?: { CN?: string }; fingerprint256?: string };
+    authorized?: boolean;
+  };
+  if (typeof tlsSocket.getPeerCertificate !== 'function') {
+    return undefined;
+  }
+  const certificate = tlsSocket.getPeerCertificate();
+  if (!certificate || Object.keys(certificate).length === 0) {
+    return undefined;
+  }
+  return {
+    subject: certificate.subject,
+    fingerprint256: certificate.fingerprint256,
+    valid: true,
+  };
+}
+
+function respondAuthFailure(stream: http2.ServerHttp2Stream, statusCode: number, reason: string): void {
+  stream.respond({ ':status': statusCode, 'x-shield-reason': reason });
+  stream.end(reason);
+}
+
 export function createHttp2Server(
   config: ServerConfig,
   http2Config: Http2Config,
@@ -84,6 +107,24 @@ export function createHttp2Server(
   uam: UnderAttackMode,
 ): void {
   const tls = getTLSOptions(config);
+  const zeroTrust = new ZeroTrustGateway({
+    ...DEFAULT_ZERO_TRUST_CONFIG,
+    ...config.zeroTrust,
+    jwt: {
+      ...DEFAULT_ZERO_TRUST_CONFIG.jwt,
+      ...config.zeroTrust?.jwt,
+      publicKeys: config.zeroTrust?.jwt?.publicKeys ?? DEFAULT_ZERO_TRUST_CONFIG.jwt.publicKeys,
+    },
+    apiKeys: {
+      ...DEFAULT_ZERO_TRUST_CONFIG.apiKeys,
+      ...config.zeroTrust?.apiKeys,
+      keys: config.zeroTrust?.apiKeys?.keys ?? DEFAULT_ZERO_TRUST_CONFIG.apiKeys.keys,
+    },
+    mtls: {
+      ...DEFAULT_ZERO_TRUST_CONFIG.mtls,
+      ...config.zeroTrust?.mtls,
+    },
+  });
 
   const proxy = httpProxy.createProxyServer({
     target: config.target,
@@ -99,17 +140,16 @@ export function createHttp2Server(
     }
   });
 
-  // Per-IP reset tracking (across sessions)
   const ipResetCounters = new LRUCache<SlidingWindowCounter>(100000, 60000);
   const ipStreamCounters = new LRUCache<SlidingWindowCounter>(100000, 60000);
-  const blockedIPs = new LRUCache<boolean>(100000, 300000); // 5 min block
+  const blockedIPs = new LRUCache<boolean>(100000, 300000);
 
   const server = http2.createSecureServer({
     ...tls,
     settings: {
       maxConcurrentStreams: http2Config.maxConcurrentStreams,
     },
-    allowHTTP1: true, // Fallback for HTTP/1.1 clients
+    allowHTTP1: true,
   });
   const tlsGuard = new TLSGuard({
     ...DEFAULT_TLS_GUARD_CONFIG,
@@ -119,7 +159,7 @@ export function createHttp2Server(
 
   server.on('session', (session) => {
     const state: SessionState = {
-      ip: (session.socket.remoteAddress ?? '0.0.0.0'),
+      ip: session.socket.remoteAddress ?? '0.0.0.0',
       streamCount: 0,
       activeStreams: 0,
       resetCount: 0,
@@ -129,7 +169,6 @@ export function createHttp2Server(
       createdAt: Date.now(),
     };
 
-    // === Per-IP block check ===
     if (blockedIPs.get(state.ip) || tlsGuard.isBlocked(state.ip)) {
       log.warn(`Blocked IP ${state.ip} tried HTTP/2 connection`);
       session.destroy();
@@ -159,18 +198,13 @@ export function createHttp2Server(
       }
 
       const streamCreatedAt = Date.now();
-
-      // Rapid Reset: track RST_STREAM events
       stream.on('aborted', () => {
         state.activeStreams = Math.max(0, state.activeStreams - 1);
         const elapsed = Date.now() - streamCreatedAt;
-
-        // Fast RST (< 100ms after creation) = likely rapid reset attack
         if (elapsed < 100) {
           state.resetCount++;
           state.resetRateCounter.increment(Date.now());
 
-          // Per-IP tracking
           let ipCounter = ipResetCounters.get(state.ip);
           if (!ipCounter) {
             ipCounter = new SlidingWindowCounter(1000);
@@ -178,9 +212,7 @@ export function createHttp2Server(
           }
           ipCounter.increment(Date.now());
           const ipResetRate = ipCounter.getRate();
-
           const sessionResetRate = state.resetRateCounter.getRate();
-
           if (sessionResetRate > http2Config.maxResetPerSec || ipResetRate > http2Config.maxResetPerSec * 2) {
             state.blocked = true;
             blockedIPs.set(state.ip, true);
@@ -203,19 +235,17 @@ export function createHttp2Server(
         state.activeStreams = Math.max(0, state.activeStreams - 1);
       });
 
-      // === Build req-like object for shield ===
-      const method = (headers[':method'] ?? 'GET').toUpperCase();
-      const path = headers[':path'] ?? '/';
+      const method = String(headers[':method'] ?? 'GET').toUpperCase();
+      const path = String(headers[':path'] ?? '/');
       const ip = state.ip;
 
       const plainHeaders: Record<string, string> = {};
-      for (const [k, v] of Object.entries(headers)) {
-        if (!k.startsWith(':') && v) {
-          plainHeaders[k] = Array.isArray(v) ? v.join(', ') : v;
+      for (const [key, value] of Object.entries(headers)) {
+        if (!key.startsWith(':') && value) {
+          plainHeaders[key] = Array.isArray(value) ? value.join(', ') : String(value);
         }
       }
 
-      // === Internal endpoints ===
       if (path === '/shield-health') {
         stream.respond({ ':status': 200, 'content-type': 'application/json' });
         stream.end(JSON.stringify({ status: 'ok', uptime: process.uptime() }));
@@ -232,17 +262,14 @@ export function createHttp2Server(
           return;
         }
         if (path.startsWith('/shield-api/')) {
-          // Fake http.ServerResponse compatible object for handleDashboardAPI
-          let body = '';
           const fakeRes = {
             writeHead: (code: number, h?: Record<string, string>) => {
               stream.respond({ ':status': code, ...(h ?? {}) });
             },
-            end: (data: string) => { body = data; stream.end(data); },
-            setHeader: (_k: string, _v: string) => { /* noop */ },
+            end: (data: string) => { stream.end(data); },
+            setHeader: () => undefined,
           } as unknown as import('http').ServerResponse;
           handleDashboardAPI(path, shield, fakeRes);
-          void body;
           return;
         }
         stream.respond({ ':status': 200, 'content-type': 'text/html; charset=utf-8' });
@@ -250,11 +277,9 @@ export function createHttp2Server(
         return;
       }
 
-      // === UAM check ===
       if (uam.isActive() && !uam.isExempt(path)) {
-        if (!uam.isCleared(plainHeaders['cookie'], ip)) {
+        if (!uam.isCleared(plainHeaders.cookie, ip)) {
           if (path === '/_sg_uam_verify' && method === 'POST') {
-            // Handle PoW verification
             let body = '';
             stream.on('data', (chunk: Buffer) => { body += chunk.toString(); });
             stream.on('end', () => {
@@ -283,53 +308,75 @@ export function createHttp2Server(
         }
       }
 
-      // === Shield processing ===
-      let decodedPath = path;
-      try { decodedPath = decodeURIComponent(path); } catch { /* keep raw */ }
-
-      const httpReq: HTTPRequest = {
-        ip,
-        method,
-        url: decodedPath,
-        headers: plainHeaders,
-        userAgent: plainHeaders['user-agent'],
-        timestamp: Date.now(),
-      };
-
-      const result = shield.processHTTPRequest(httpReq);
-
-      if (result.action === Action.ALLOW) {
-        // Use HTTP/1.1 proxy (http-proxy doesn't support H2 upstream well)
-        // Convert stream to req/res for http-proxy
-        const fakeReq = Object.assign(stream, {
-          url: path,
-          method,
-          headers: { ...headers, ...plainHeaders },
+      void (async () => {
+        const authResult = await zeroTrust.authenticate({
+          headers: plainHeaders,
+          requestPath: path,
+          clientCert: getPeerCertificate(session),
+          isTls: true,
         });
-        const fakeRes = {
-          writeHead: (code: number, h?: Record<string, string>) => {
-            stream.respond({ ':status': code, ...(h ?? {}) });
-          },
-          write: (chunk: Buffer | string) => stream.write(chunk),
-          end: (chunk?: Buffer | string) => { if (chunk) stream.write(chunk); stream.end(); },
-          on: stream.on.bind(stream),
-          setHeader: (_k: string, _v: string) => {},
-          getHeader: () => undefined,
-          removeHeader: () => {},
+        if (!authResult.allowed) {
+          respondAuthFailure(stream, authResult.statusCode, authResult.reason ?? 'Access denied');
+          return;
+        }
+
+        let decodedPath = path;
+        try { decodedPath = decodeURIComponent(path); } catch { /* keep raw */ }
+
+        const httpReq: HTTPRequest = {
+          ip,
+          method,
+          url: decodedPath,
+          headers: plainHeaders,
+          userAgent: plainHeaders['user-agent'],
+          timestamp: Date.now(),
         };
-        proxy.web(fakeReq as unknown as import('http').IncomingMessage,
-          fakeRes as unknown as import('http').ServerResponse);
-        return;
-      }
 
-      if (result.action === Action.RATE_LIMIT) {
-        stream.respond({ ':status': 429, 'retry-after': '1', 'x-shield-reason': result.reason });
-        stream.end('Too Many Requests');
-        return;
-      }
+        const result = shield.processHTTPRequest(httpReq);
+        if (result.action === Action.ALLOW) {
+          const fakeReq = Object.assign(stream, {
+            url: path,
+            method,
+            headers: { ...headers, ...plainHeaders },
+          });
+          const fakeRes = {
+            writeHead: (code: number, h?: Record<string, string>) => {
+              stream.respond({ ':status': code, ...(h ?? {}) });
+            },
+            write: (chunk: Buffer | string) => stream.write(chunk),
+            end: (chunk?: Buffer | string) => { if (chunk) stream.write(chunk); stream.end(); },
+            on: stream.on.bind(stream),
+            setHeader: () => undefined,
+            getHeader: () => undefined,
+            removeHeader: () => undefined,
+          };
+          proxy.web(
+            fakeReq as unknown as import('http').IncomingMessage,
+            fakeRes as unknown as import('http').ServerResponse,
+          );
+          return;
+        }
 
-      stream.respond({ ':status': 403, 'x-shield-reason': result.reason });
-      stream.end('Forbidden');
+        if (result.action === Action.RATE_LIMIT) {
+          stream.respond({ ':status': 429, 'retry-after': '1', 'x-shield-reason': result.reason });
+          stream.end('Too Many Requests');
+          return;
+        }
+
+        stream.respond({ ':status': 403, 'x-shield-reason': result.reason });
+        stream.end('Forbidden');
+      })().catch((error: Error) => {
+        log.error('Unhandled HTTP/2 request processing failure', {
+          message: error.message,
+          path,
+          method,
+          ip,
+        });
+        if (!stream.closed) {
+          stream.respond({ ':status': 500 });
+          stream.end('Internal Server Error');
+        }
+      });
     });
 
     session.on('error', (err) => {
