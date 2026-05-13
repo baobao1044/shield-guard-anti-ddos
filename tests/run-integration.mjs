@@ -35,15 +35,47 @@ async function main() {
 
   const tempDir = await mkdtemp(path.join(tmpdir(), 'shield-guard-test-'));
   try {
-    const invalidConfig = path.join(tempDir, 'invalid-config.json');
-    await writeFile(invalidConfig, JSON.stringify({
+    const invalidTlsConfig = path.join(tempDir, 'invalid-tls-config.json');
+    await writeFile(invalidTlsConfig, JSON.stringify({
       target: 'http://localhost:3000',
       port: 18080,
       httpsPort: 18443,
     }), 'utf8');
 
-    expectFailure([shieldEntry, '--config', invalidConfig], /httpsPort requires tls\.cert\/key or tls\.selfSigned=true/i);
+    expectFailure([shieldEntry, '--config', invalidTlsConfig], /httpsPort requires tls\.cert\/key or tls\.selfSigned=true/i);
     console.log('PASS config validation rejects https without tls material');
+
+    const invalidJwtConfig = path.join(tempDir, 'invalid-jwt-config.json');
+    await writeFile(invalidJwtConfig, JSON.stringify({
+      target: 'http://localhost:3000',
+      port: 18080,
+      zeroTrust: {
+        enabled: true,
+        mtls: {
+          enabled: false,
+          requireClientCert: false,
+          allowedCNs: [],
+          allowedFingerprints: [],
+        },
+        jwt: {
+          enabled: true,
+          headerName: 'authorization',
+          algorithms: ['RS256'],
+          issuer: 'shield-guard',
+          audience: 'shield-clients',
+          clockToleranceSec: 30,
+          publicKeys: [],
+        },
+        apiKeys: {
+          enabled: false,
+          headerName: 'x-api-key',
+          keys: [],
+        },
+      },
+    }), 'utf8');
+
+    expectFailure([shieldEntry, '--config', invalidJwtConfig], /zeroTrust\.jwt requires sharedSecret, jwksUri, or publicKeys/i);
+    console.log('PASS zero-trust validation rejects JWT without verifier material');
 
   } finally {
     await rm(tempDir, { recursive: true, force: true });
