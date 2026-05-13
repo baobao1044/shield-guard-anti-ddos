@@ -19,6 +19,7 @@ import { TLSGuard, DEFAULT_TLS_GUARD_CONFIG } from '../layers/tls-guard';
 import { TarpitSystem, DEFAULT_TARPIT_CONFIG } from '../layers/tarpit';
 import { JA3Fingerprinter, DEFAULT_JA3_CONFIG } from '../layers/ja3-fingerprint';
 import { WSStream, DEFAULT_WS_CONFIG } from '../stats/ws-stream';
+import { DEFAULT_ZERO_TRUST_CONFIG, ZeroTrustGateway } from './mtls-gateway';
 
 const log = new Logger('Proxy');
 const MAX_BODY_INSPECTION_BYTES = 1024 * 1024;
@@ -39,6 +40,25 @@ function isTrustedProxy(config: ServerConfig, remoteIP: string): boolean {
   return trusted.includes(remoteIP);
 }
 
+function getPeerCertificate(socket: http.IncomingMessage['socket']) {
+  const tlsSocket = socket as http.IncomingMessage['socket'] & {
+    getPeerCertificate?: () => { subject?: { CN?: string }; fingerprint256?: string };
+    authorized?: boolean;
+  };
+  if (typeof tlsSocket.getPeerCertificate !== 'function') {
+    return undefined;
+  }
+  const certificate = tlsSocket.getPeerCertificate();
+  if (!certificate || Object.keys(certificate).length === 0) {
+    return undefined;
+  }
+  return {
+    subject: certificate.subject,
+    fingerprint256: certificate.fingerprint256,
+    valid: true,
+  };
+}
+
 export function getClientIP(req: http.IncomingMessage, config: ServerConfig): string {
   const remoteIP = normalizeIPAddress(req.socket?.remoteAddress);
   const forwarded = req.headers['x-forwarded-for'];
@@ -56,6 +76,8 @@ function getTLSOptions(config: ServerConfig): https.ServerOptions {
     return {
       cert: fs.readFileSync(config.tls.cert),
       key: fs.readFileSync(config.tls.key),
+      requestCert: config.zeroTrust?.enabled && config.zeroTrust.mtls.enabled,
+      rejectUnauthorized: false,
     };
   }
   log.warn('No TLS cert provided, generating self-signed certificate');
@@ -64,7 +86,12 @@ function getTLSOptions(config: ServerConfig): https.ServerOptions {
   const pems = selfsigned.generate([{ name: 'commonName', value: 'shield-guard' }], {
     days: 365, keySize: 2048,
   });
-  return { cert: pems.cert, key: pems.private };
+  return {
+    cert: pems.cert,
+    key: pems.private,
+    requestCert: config.zeroTrust?.enabled && config.zeroTrust.mtls.enabled,
+    rejectUnauthorized: false,
+  };
 }
 
 function checkDashboardAuth(req: http.IncomingMessage, password?: string): boolean {
@@ -116,9 +143,6 @@ function readInspectableBody(req: http.IncomingMessage, maxInspectionBytes: numb
         reject(new Error('Request body exceeded inspection limit'));
         return;
       }
-      if (finished) {
-        return;
-      }
       chunks.push(chunk);
     });
     req.on('end', () => {
@@ -158,12 +182,18 @@ function buildHTTPRequest(ip: string, method: string, url: string, headers: Reco
   };
 }
 
+function respondAuthFailure(res: http.ServerResponse, statusCode: number, reason: string): void {
+  res.writeHead(statusCode, {
+    'Content-Type': 'text/plain',
+    'X-Shield-Reason': reason,
+  });
+  res.end(`${statusCode} Access Denied\n\n${reason}`);
+}
+
 export function createProxyServer(
   config: ServerConfig,
   shield: AntiDDoSShield,
 ): { uam: UnderAttackMode } {
-  // === Initialize protection modules ===
-
   const uam = new UnderAttackMode({
     ...DEFAULT_UAM_CONFIG,
     ...config.uam,
@@ -180,14 +210,10 @@ export function createProxyServer(
     ...config.tlsGuard,
   });
 
-  // === New Feature Modules ===
-
   const tarpit = new TarpitSystem({
     ...DEFAULT_TARPIT_CONFIG,
     ...config.tarpit,
   });
-
-  // Wire tarpit auto-blacklist to shield L3
   tarpit.onBlacklist((ip) => shield.blacklistIP(ip));
 
   const ja3 = new JA3Fingerprinter({
@@ -200,7 +226,24 @@ export function createProxyServer(
     ...config.wsStream,
   });
 
-  // === Proxy ===
+  const zeroTrust = new ZeroTrustGateway({
+    ...DEFAULT_ZERO_TRUST_CONFIG,
+    ...config.zeroTrust,
+    jwt: {
+      ...DEFAULT_ZERO_TRUST_CONFIG.jwt,
+      ...config.zeroTrust?.jwt,
+      publicKeys: config.zeroTrust?.jwt?.publicKeys ?? DEFAULT_ZERO_TRUST_CONFIG.jwt.publicKeys,
+    },
+    apiKeys: {
+      ...DEFAULT_ZERO_TRUST_CONFIG.apiKeys,
+      ...config.zeroTrust?.apiKeys,
+      keys: config.zeroTrust?.apiKeys?.keys ?? DEFAULT_ZERO_TRUST_CONFIG.apiKeys.keys,
+    },
+    mtls: {
+      ...DEFAULT_ZERO_TRUST_CONFIG.mtls,
+      ...config.zeroTrust?.mtls,
+    },
+  });
 
   const proxy = httpProxy.createProxyServer({
     target: config.target,
@@ -238,16 +281,11 @@ export function createProxyServer(
     });
   };
 
-  // === Core request handler ===
-
   function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
     const ip = getClientIP(req, config);
     const url = req.url ?? '/';
     const method = req.method ?? 'GET';
 
-    // === Internal endpoints (always bypass shield) ===
-
-    // === Honeypot check (before any other processing) ===
     if (tarpit.isHoneypot(url)) {
       tarpit.handleHoneypotHit(req, res, ip);
       return;
@@ -288,12 +326,8 @@ export function createProxyServer(
       return;
     }
 
-    // === UAM: Under Attack Mode ===
-
     if (uam.isActive() && !uam.isExempt(url)) {
       const cookieHeader = req.headers['cookie'];
-
-      // UAM verify endpoint: POST /_sg_uam_verify with {nonce, solution}
       if (url === '/_sg_uam_verify' && method === 'POST') {
         let body = '';
         req.on('data', (c: Buffer) => { body += c.toString(); });
@@ -319,7 +353,6 @@ export function createProxyServer(
         return;
       }
 
-      // Check clearance cookie
       if (!uam.isCleared(cookieHeader, ip)) {
         const nonce = uam.issueChallenge(ip);
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -328,15 +361,24 @@ export function createProxyServer(
       }
     }
 
-    // === Build HTTPRequest for shield ===
-
     const headers = normalizeHeaders(req);
-    const processRequest = (bodyText?: string, bodyBuffer?: Buffer) => {
-      const httpReq = buildHTTPRequest(ip, method, url, headers, bodyText, bodyBuffer);
 
+    const processRequest = async (bodyText?: string, bodyBuffer?: Buffer) => {
+      const authResult = await zeroTrust.authenticate({
+        headers,
+        requestPath: url,
+        clientCert: getPeerCertificate(req.socket),
+        isTls: (req.socket as { encrypted?: boolean }).encrypted === true,
+      });
+
+      if (!authResult.allowed) {
+        respondAuthFailure(res, authResult.statusCode, authResult.reason ?? 'Access denied');
+        return;
+      }
+
+      const httpReq = buildHTTPRequest(ip, method, url, headers, bodyText, bodyBuffer);
       const result = shield.processHTTPRequest(httpReq);
 
-      // Auto-activate UAM if adaptive mode detects critical threat
       if (shield.getCurrentRPS() > (config.uam?.autoActivateThreshold ?? DEFAULT_UAM_CONFIG.autoActivateThreshold)) {
         uam.activate();
       }
@@ -361,15 +403,13 @@ export function createProxyServer(
       }
 
       if (result.action === Action.CHALLENGE) {
-        // Upgrade to UAM challenge instead of simple math
         const nonce = uam.issueChallenge(ip);
-        uam.activate(); // bot detected → activate UAM
+        uam.activate();
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(uam.renderPage(nonce));
         return;
       }
 
-      // DROP / BLACKHOLE
       res.writeHead(403, {
         'Content-Type': 'text/plain',
         'X-Shield-Reason': result.reason,
@@ -379,7 +419,13 @@ export function createProxyServer(
 
     const maxInspectionBytes = config.shield?.l7?.httpFloodProtection?.requestSizeLimit ?? MAX_BODY_INSPECTION_BYTES;
     if (!shouldInspectBody(method, headers, maxInspectionBytes)) {
-      processRequest();
+      void processRequest().catch((error: Error) => {
+        log.error('Unhandled request processing failure', { message: error.message, method, url, ip });
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'text/plain' });
+          res.end('500 Internal Server Error');
+        }
+      });
       return;
     }
 
@@ -400,38 +446,33 @@ export function createProxyServer(
           url,
           ip,
         });
-        processRequest();
+        void processRequest().catch((error: Error) => {
+          log.error('Unhandled request processing failure', { message: error.message, method, url, ip });
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            res.end('500 Internal Server Error');
+          }
+        });
       });
   }
 
-  // === Start HTTP server ===
-
   const httpServer = http.createServer(handleRequest);
   trackConnections(httpServer);
-  slowloris.attach(httpServer); // hook slowloris detection at socket level
-  wsStream.attach(httpServer, shield); // attach WebSocket stream
+  slowloris.attach(httpServer);
+  wsStream.attach(httpServer, shield);
   httpServer.listen(config.port, () => {
     log.success(`HTTP  listening on port ${config.port}`);
   });
-
-  // === Start HTTPS server ===
 
   if (config.httpsPort) {
     const tlsOpts = getTLSOptions(config);
     const httpsServer = https.createServer(tlsOpts, handleRequest);
     trackConnections(httpsServer);
-
-    // Hook TLS guard for handshake tracking
     tlsGuard.attach(httpsServer);
-
-    // Hook JA3 fingerprinting on TLS
     httpsServer.on('secureConnection', (socket) => {
       ja3.extractFingerprint(socket);
     });
-
-    // Hook slowloris on HTTPS too
     slowloris.attach(httpsServer as unknown as http.Server);
-
     httpsServer.listen(config.httpsPort, () => {
       log.success(`HTTPS listening on port ${config.httpsPort} (TLS guard active)`);
     });
