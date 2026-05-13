@@ -19,12 +19,19 @@ import { TLSGuard, DEFAULT_TLS_GUARD_CONFIG } from '../layers/tls-guard';
 import { TarpitSystem, DEFAULT_TARPIT_CONFIG } from '../layers/tarpit';
 import { JA3Fingerprinter, DEFAULT_JA3_CONFIG } from '../layers/ja3-fingerprint';
 import { WSStream, DEFAULT_WS_CONFIG } from '../stats/ws-stream';
+import { ZeroTrustGateway, DEFAULT_ZERO_TRUST_CONFIG, AuthResult } from './mtls-gateway';
 
 const log = new Logger('Proxy');
 const MAX_BODY_INSPECTION_BYTES = 1024 * 1024;
 
 type BufferedRequest = http.IncomingMessage & {
   shieldGuardBufferedBody?: Buffer;
+};
+
+type ClientCertInfo = {
+  subject?: { CN?: string };
+  fingerprint256?: string;
+  valid?: boolean;
 };
 
 export { UnderAttackMode };
@@ -51,20 +58,72 @@ export function getClientIP(req: http.IncomingMessage, config: ServerConfig): st
   return remoteIP;
 }
 
-function getTLSOptions(config: ServerConfig): https.ServerOptions {
-  if (config.tls?.cert && config.tls?.key) {
-    return {
-      cert: fs.readFileSync(config.tls.cert),
-      key: fs.readFileSync(config.tls.key),
-    };
+function getClientCertificate(req: http.IncomingMessage): ClientCertInfo | undefined {
+  const socket = req.socket as http.IncomingMessage['socket'] & { getPeerCertificate?: () => Record<string, unknown> };
+  if (typeof socket.getPeerCertificate !== 'function') {
+    return undefined;
   }
-  log.warn('No TLS cert provided, generating self-signed certificate');
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const selfsigned = require('selfsigned');
-  const pems = selfsigned.generate([{ name: 'commonName', value: 'shield-guard' }], {
-    days: 365, keySize: 2048,
+
+  const certificate = socket.getPeerCertificate();
+  if (!certificate || Object.keys(certificate).length === 0) {
+    return { valid: false };
+  }
+
+  return {
+    subject: certificate.subject as { CN?: string } | undefined,
+    fingerprint256: typeof certificate.fingerprint256 === 'string' ? certificate.fingerprint256 : undefined,
+    valid: true,
+  };
+}
+
+function buildZeroTrustGateway(config: ServerConfig): ZeroTrustGateway {
+  return new ZeroTrustGateway({
+    ...DEFAULT_ZERO_TRUST_CONFIG,
+    ...config.zeroTrust,
+    mtls: {
+      ...DEFAULT_ZERO_TRUST_CONFIG.mtls,
+      ...(config.zeroTrust?.mtls ?? {}),
+      allowedCNs: config.zeroTrust?.mtls?.allowedCNs ?? DEFAULT_ZERO_TRUST_CONFIG.mtls.allowedCNs,
+      allowedFingerprints: config.zeroTrust?.mtls?.allowedFingerprints ?? DEFAULT_ZERO_TRUST_CONFIG.mtls.allowedFingerprints,
+    },
+    jwt: {
+      ...DEFAULT_ZERO_TRUST_CONFIG.jwt,
+      ...(config.zeroTrust?.jwt ?? {}),
+      algorithms: config.zeroTrust?.jwt?.algorithms ?? DEFAULT_ZERO_TRUST_CONFIG.jwt.algorithms,
+      sharedSecrets: config.zeroTrust?.jwt?.sharedSecrets ?? DEFAULT_ZERO_TRUST_CONFIG.jwt.sharedSecrets,
+      publicKeys: config.zeroTrust?.jwt?.publicKeys ?? DEFAULT_ZERO_TRUST_CONFIG.jwt.publicKeys,
+    },
+    apiKeys: {
+      ...DEFAULT_ZERO_TRUST_CONFIG.apiKeys,
+      ...(config.zeroTrust?.apiKeys ?? {}),
+      keys: config.zeroTrust?.apiKeys?.keys ?? DEFAULT_ZERO_TRUST_CONFIG.apiKeys.keys,
+    },
   });
-  return { cert: pems.cert, key: pems.private };
+}
+
+function getTLSOptions(config: ServerConfig): https.ServerOptions {
+  const options: https.ServerOptions = config.tls?.cert && config.tls?.key
+    ? {
+        cert: fs.readFileSync(config.tls.cert),
+        key: fs.readFileSync(config.tls.key),
+      }
+    : (() => {
+        log.warn('No TLS cert provided, generating self-signed certificate');
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const selfsigned = require('selfsigned');
+        const pems = selfsigned.generate([{ name: 'commonName', value: 'shield-guard' }], {
+          days: 365,
+          keySize: 2048,
+        });
+        return { cert: pems.cert, key: pems.private };
+      })();
+
+  if (config.zeroTrust?.mtls?.enabled) {
+    options.requestCert = true;
+    options.rejectUnauthorized = false;
+  }
+
+  return options;
 }
 
 function checkDashboardAuth(req: http.IncomingMessage, password?: string): boolean {
@@ -78,10 +137,27 @@ function checkDashboardAuth(req: http.IncomingMessage, password?: string): boole
   try { return crypto.timingSafeEqual(expected, provided); } catch { return false; }
 }
 
+function writeZeroTrustFailure(res: http.ServerResponse, result: AuthResult): void {
+  const reason = result.reason ?? 'Authentication failed';
+  if (reason.toLowerCase().includes('rate limit')) {
+    res.writeHead(429, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: reason }));
+    return;
+  }
+
+  const status = reason.toLowerCase().includes('not authorized') ? 403 : 401;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (status === 401) {
+    headers['WWW-Authenticate'] = 'Bearer realm="Shield Guard Zero Trust"';
+  }
+  res.writeHead(status, headers);
+  res.end(JSON.stringify({ ok: false, error: reason }));
+}
+
 function normalizeHeaders(req: http.IncomingMessage): Record<string, string> {
   const headers: Record<string, string> = {};
-  for (const [k, v] of Object.entries(req.headers)) {
-    if (v) headers[k] = Array.isArray(v) ? v.join(', ') : v;
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (value) headers[key] = Array.isArray(value) ? value.join(', ') : value;
   }
   return headers;
 }
@@ -89,8 +165,7 @@ function normalizeHeaders(req: http.IncomingMessage): Record<string, string> {
 function hasRequestBody(method: string, headers: Record<string, string>): boolean {
   const contentLength = Number.parseInt(headers['content-length'] ?? '', 10);
   if (Number.isFinite(contentLength) && contentLength > 0) return true;
-  return (headers['transfer-encoding'] ?? '').toLowerCase().includes('chunked')
-    || !['GET', 'HEAD'].includes(method);
+  return (headers['transfer-encoding'] ?? '').toLowerCase().includes('chunked') || !['GET', 'HEAD'].includes(method);
 }
 
 function shouldInspectBody(method: string, headers: Record<string, string>, maxInspectionBytes: number): boolean {
@@ -116,19 +191,13 @@ function readInspectableBody(req: http.IncomingMessage, maxInspectionBytes: numb
         reject(new Error('Request body exceeded inspection limit'));
         return;
       }
-      if (finished) {
-        return;
-      }
       chunks.push(chunk);
     });
     req.on('end', () => {
       if (finished) return;
       finished = true;
       const bodyBuffer = Buffer.concat(chunks);
-      resolve({
-        bodyBuffer,
-        bodyText: bodyBuffer.toString('utf8'),
-      });
+      resolve({ bodyBuffer, bodyText: bodyBuffer.toString('utf8') });
     });
     req.on('error', (error) => {
       if (finished) return;
@@ -158,12 +227,7 @@ function buildHTTPRequest(ip: string, method: string, url: string, headers: Reco
   };
 }
 
-export function createProxyServer(
-  config: ServerConfig,
-  shield: AntiDDoSShield,
-): { uam: UnderAttackMode } {
-  // === Initialize protection modules ===
-
+export function createProxyServer(config: ServerConfig, shield: AntiDDoSShield): { uam: UnderAttackMode } {
   const uam = new UnderAttackMode({
     ...DEFAULT_UAM_CONFIG,
     ...config.uam,
@@ -180,14 +244,10 @@ export function createProxyServer(
     ...config.tlsGuard,
   });
 
-  // === New Feature Modules ===
-
   const tarpit = new TarpitSystem({
     ...DEFAULT_TARPIT_CONFIG,
     ...config.tarpit,
   });
-
-  // Wire tarpit auto-blacklist to shield L3
   tarpit.onBlacklist((ip) => shield.blacklistIP(ip));
 
   const ja3 = new JA3Fingerprinter({
@@ -200,7 +260,7 @@ export function createProxyServer(
     ...config.wsStream,
   });
 
-  // === Proxy ===
+  const zeroTrust = buildZeroTrustGateway(config);
 
   const proxy = httpProxy.createProxyServer({
     target: config.target,
@@ -238,16 +298,12 @@ export function createProxyServer(
     });
   };
 
-  // === Core request handler ===
-
   function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
     const ip = getClientIP(req, config);
     const url = req.url ?? '/';
     const method = req.method ?? 'GET';
+    const headers = normalizeHeaders(req);
 
-    // === Internal endpoints (always bypass shield) ===
-
-    // === Honeypot check (before any other processing) ===
     if (tarpit.isHoneypot(url)) {
       tarpit.handleHoneypotHit(req, res, ip);
       return;
@@ -262,11 +318,7 @@ export function createProxyServer(
 
     if (url === '/shield-health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        status: 'ok',
-        uptime: process.uptime(),
-        uam: uam.isActive(),
-      }));
+      res.end(JSON.stringify({ status: 'ok', uptime: process.uptime(), uam: uam.isActive() }));
       return;
     }
 
@@ -288,24 +340,24 @@ export function createProxyServer(
       return;
     }
 
-    // === UAM: Under Attack Mode ===
+    const authResult = zeroTrust.authenticate(headers, url, getClientCertificate(req));
+    if (!authResult.allowed) {
+      writeZeroTrustFailure(res, authResult);
+      return;
+    }
 
     if (uam.isActive() && !uam.isExempt(url)) {
       const cookieHeader = req.headers['cookie'];
 
-      // UAM verify endpoint: POST /_sg_uam_verify with {nonce, solution}
       if (url === '/_sg_uam_verify' && method === 'POST') {
         let body = '';
-        req.on('data', (c: Buffer) => { body += c.toString(); });
+        req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
         req.on('end', () => {
           try {
             const { nonce, solution } = JSON.parse(body);
             if (uam.verifySolution(nonce, solution, ip)) {
               const cookie = uam.generateClearanceCookie(ip);
-              res.writeHead(200, {
-                'Content-Type': 'application/json',
-                'Set-Cookie': cookie,
-              });
+              res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': cookie });
               res.end(JSON.stringify({ ok: true }));
             } else {
               res.writeHead(403, { 'Content-Type': 'application/json' });
@@ -319,7 +371,6 @@ export function createProxyServer(
         return;
       }
 
-      // Check clearance cookie
       if (!uam.isCleared(cookieHeader, ip)) {
         const nonce = uam.issueChallenge(ip);
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -328,23 +379,17 @@ export function createProxyServer(
       }
     }
 
-    // === Build HTTPRequest for shield ===
-
-    const headers = normalizeHeaders(req);
     const processRequest = (bodyText?: string, bodyBuffer?: Buffer) => {
       const httpReq = buildHTTPRequest(ip, method, url, headers, bodyText, bodyBuffer);
-
       const result = shield.processHTTPRequest(httpReq);
 
-      // Auto-activate UAM if adaptive mode detects critical threat
       if (shield.getCurrentRPS() > (config.uam?.autoActivateThreshold ?? DEFAULT_UAM_CONFIG.autoActivateThreshold)) {
         uam.activate();
       }
 
       if (result.action === Action.ALLOW) {
         if (bodyBuffer) {
-          const bufferedReq = req as BufferedRequest;
-          bufferedReq.shieldGuardBufferedBody = bodyBuffer;
+          (req as BufferedRequest).shieldGuardBufferedBody = bodyBuffer;
         }
         proxy.web(req, res);
         return;
@@ -361,15 +406,13 @@ export function createProxyServer(
       }
 
       if (result.action === Action.CHALLENGE) {
-        // Upgrade to UAM challenge instead of simple math
         const nonce = uam.issueChallenge(ip);
-        uam.activate(); // bot detected → activate UAM
+        uam.activate();
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(uam.renderPage(nonce));
         return;
       }
 
-      // DROP / BLACKHOLE
       res.writeHead(403, {
         'Content-Type': 'text/plain',
         'X-Shield-Reason': result.reason,
@@ -387,10 +430,7 @@ export function createProxyServer(
       .then(({ bodyBuffer, bodyText }) => processRequest(bodyText, bodyBuffer))
       .catch((err: Error) => {
         if (err.message === 'Request body exceeded inspection limit') {
-          res.writeHead(413, {
-            'Content-Type': 'text/plain',
-            'X-Shield-Reason': err.message,
-          });
+          res.writeHead(413, { 'Content-Type': 'text/plain', 'X-Shield-Reason': err.message });
           res.end('413 Payload Too Large\n\nShield Guard inspection limit exceeded.');
           return;
         }
@@ -404,32 +444,22 @@ export function createProxyServer(
       });
   }
 
-  // === Start HTTP server ===
-
   const httpServer = http.createServer(handleRequest);
   trackConnections(httpServer);
-  slowloris.attach(httpServer); // hook slowloris detection at socket level
-  wsStream.attach(httpServer, shield); // attach WebSocket stream
+  slowloris.attach(httpServer);
+  wsStream.attach(httpServer, shield);
   httpServer.listen(config.port, () => {
     log.success(`HTTP  listening on port ${config.port}`);
   });
-
-  // === Start HTTPS server ===
 
   if (config.httpsPort) {
     const tlsOpts = getTLSOptions(config);
     const httpsServer = https.createServer(tlsOpts, handleRequest);
     trackConnections(httpsServer);
-
-    // Hook TLS guard for handshake tracking
     tlsGuard.attach(httpsServer);
-
-    // Hook JA3 fingerprinting on TLS
     httpsServer.on('secureConnection', (socket) => {
       ja3.extractFingerprint(socket);
     });
-
-    // Hook slowloris on HTTPS too
     slowloris.attach(httpsServer as unknown as http.Server);
 
     httpsServer.listen(config.httpsPort, () => {
