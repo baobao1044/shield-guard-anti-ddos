@@ -73,18 +73,34 @@ function loadConfig(): ServerConfig {
 
   // CLI args override file config
   const merged: Partial<ServerConfig> = {
-    target: cli.target ?? (fileConfig.target as string) ?? 'http://localhost:3000',
-    port: cli.port ?? (fileConfig.port as number) ?? 8080,
-    httpsPort: cli.httpsPort ?? (fileConfig.httpsPort as number | undefined),
+    target: cli.target ?? fileConfig.target ?? 'http://localhost:3000',
+    port: cli.port ?? fileConfig.port ?? 8080,
+    httpsPort: cli.httpsPort ?? fileConfig.httpsPort,
+    trustedProxies: fileConfig.trustedProxies,
+    trustForwardedHeaders: fileConfig.trustForwardedHeaders,
     tls: cli.tls || fileConfig.tls
-      ? { ...(fileConfig.tls as ServerConfig['tls'] | undefined), ...(cli.tls ?? {}) }
+      ? { ...(fileConfig.tls ?? {}), ...(cli.tls ?? {}) }
       : undefined,
-    dashboardPassword: cli.dashboardPassword ?? (fileConfig.dashboardPassword as string | undefined),
-    shield: (fileConfig as ServerConfig).shield,
-    uam: (fileConfig as ServerConfig).uam,
-    http2: (fileConfig as ServerConfig).http2,
-    slowloris: (fileConfig as ServerConfig).slowloris,
-    tlsGuard: (fileConfig as ServerConfig).tlsGuard,
+    dashboardPassword: cli.dashboardPassword ?? fileConfig.dashboardPassword,
+    shield: fileConfig.shield,
+    uam: fileConfig.uam,
+    http2: fileConfig.http2,
+    slowloris: fileConfig.slowloris,
+    tlsGuard: fileConfig.tlsGuard,
+    anomaly: fileConfig.anomaly,
+    tarpit: fileConfig.tarpit,
+    correlation: fileConfig.correlation,
+    ja3: fileConfig.ja3,
+    geoip: fileConfig.geoip,
+    wsStream: fileConfig.wsStream,
+    mlWaf: fileConfig.mlWaf,
+    threatIntel: fileConfig.threatIntel,
+    forensics: fileConfig.forensics,
+    plugins: fileConfig.plugins,
+    zeroTrust: fileConfig.zeroTrust,
+    circuitBreaker: fileConfig.circuitBreaker,
+    trafficShaper: fileConfig.trafficShaper,
+    biometric: fileConfig.biometric,
   };
 
   return normalizeServerConfig(merged);
@@ -120,26 +136,6 @@ function printHelp(): void {
 `);
 }
 
-function printBanner(config: ServerConfig): void {
-  const hasHttps = !!config.httpsPort;
-  console.log(`
-\x1b[1m\x1b[36m
-  ███████╗██╗  ██╗██╗███████╗██╗     ██████╗
-  ██╔════╝██║  ██║██║██╔════╝██║     ██╔══██╗
-  ███████╗███████║██║█████╗  ██║     ██║  ██║
-  ╚════██║██╔══██║██║██╔══╝  ██║     ██║  ██║
-  ███████║██║  ██║██║███████╗███████╗██████╔╝
-  ╚══════╝╚═╝  ╚═╝╚═╝╚══════╝╚══════╝╚═════╝
-\x1b[0m\x1b[1m          G U A R D  v1.0.0\x1b[0m
-
-  \x1b[32m→\x1b[0m Target:    ${config.target}
-  \x1b[32m→\x1b[0m HTTP:      http://0.0.0.0:${config.port}${hasHttps ? `\n  \x1b[32m→\x1b[0m HTTPS:     https://0.0.0.0:${config.httpsPort}` : ''}
-  \x1b[32m→\x1b[0m Dashboard: http://localhost:${config.port}/shield-dashboard
-  \x1b[32m→\x1b[0m Health:    http://localhost:${config.port}/shield-health
-${config.dashboardPassword ? '  \x1b[33m→\x1b[0m Dashboard password: \x1b[90m[protected]\x1b[0m' : '  \x1b[33m⚠\x1b[0m  Dashboard: \x1b[33mno password set\x1b[0m (use --password)'}
-`);
-}
-
 function printBannerClean(config: ServerConfig): void {
   const hasHttps = !!config.httpsPort;
   console.log(`
@@ -157,6 +153,18 @@ function printBannerClean(config: ServerConfig): void {
   \x1b[32m->\x1b[0m Health:    http://localhost:${config.port}/shield-health
 ${config.dashboardPassword ? '  \x1b[33m->\x1b[0m Dashboard password: \x1b[90m[protected]\x1b[0m' : '  \x1b[33m!\x1b[0m  Dashboard: \x1b[33mno password set\x1b[0m (use --password)'}
 `);
+}
+
+function reportSecurityControls(config: ServerConfig): void {
+  log.info('Security controls loaded', {
+    trustForwardedHeaders: config.trustForwardedHeaders ?? false,
+    trustedProxyCount: config.trustedProxies?.length ?? 0,
+    zeroTrust: config.zeroTrust?.enabled ?? false,
+    mlWaf: config.mlWaf?.enabled ?? true,
+    threatIntel: config.threatIntel?.enabled ?? false,
+    plugins: config.plugins?.enabled ?? false,
+    wsStream: config.wsStream?.enabled ?? false,
+  });
 }
 
 // ============ Main ============
@@ -188,6 +196,7 @@ function main(): void {
   }
 
   printBannerClean(config);
+  reportSecurityControls(config);
 
   const shield = new AntiDDoSShield(config.shield, {
     anomaly: config.anomaly,
